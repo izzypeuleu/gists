@@ -1,0 +1,3590 @@
+// ==UserScript==
+// @name         pump.fun monitor bot 1.46beta
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Monitor new tokens on pump.fun with dynamic filtering, self-learning system, and risk analysis
+// @author       Claude & You
+// @match        *://*.sniperoo.app/*
+// @match        *://sniperoo.app/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_notification
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
+// @connect      public-api.solscan.io
+// @connect      price.jup.ag
+// @connect      api.coingecko.com
+// @connect      cdn.jsdelivr.net
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    /**
+     * Configuration Module
+     * Contains all configurable settings for the application
+     */
+    const Config = (function() {
+        // Default configuration
+        const defaults = {
+            // WebSocket reconnection settings
+            ws: {
+                url: 'wss://pumpportal.fun/api/data',
+                reconnectDelay: 200,
+                maxReconnectAttempts: 5
+            },
+
+            // Price information
+            price: {
+                solUsdPrice: 118.7,               // Default SOL/USD price (will be updated)
+                lastPriceUpdate: 0,               // Timestamp of last price update
+                priceUpdateInterval: 300000       // Update price every 5 minutes (300,000 ms) - FIXED
+            },
+
+            // Token filtering criteria - UPDATED VALUES
+            filters: {
+                minInitialLiquidityUSD: 4000,     // Increased from 1000 to 4000
+                minHolders: 5,                    // Kept at 5
+                minUniqueBuyers: 6,               // Increased from 3 to 6
+                initialBuyVelocity: 3.5,          // Increased from 2 to 3.5
+                maxCreatorSupplyPercent: 65,      // Reduced from 90 to 65
+                excludeNSFWNames: true,           // Kept true
+                maxSupply: 10000000000,           // Kept the same
+                whitelistedCreators: [],          // Only include tokens from these creators (empty = all)
+                blacklistedCreators: [],          // Exclude tokens from these creators
+                maxTimeFromCreation: 180,         // Reduced from 300 to 180
+                minMarketCapUSD: 1500,            // Increased from 600 to 1500
+                maxMarketCapUSD: 100000,          // Increased from 60000 to 100000
+                maxDangerScore: 70                // New parameter: maximum acceptable danger score (0-100)
+            },
+
+            // Performance monitoring settings - UPDATED VALUES
+            performance: {
+                initialMonitorPeriod: 20,         // Reduced from 30 to 20
+                extendedMonitorPeriod: 200,       // Increased from 150 to 200
+                minPriceIncrease: 8,              // Increased from 5 to 8
+                minTradeCount: 3,                 // Kept at 3
+                buyVsSellRatio: 1.6,              // Increased from 1.2 to 1.6
+                maxVolatility: 22,                // Reduced from 30 to 22
+                preferSteppedGrowth: true,        // Kept true
+                steppedGrowthThreshold: 3.5,      // Reduced from 5 to 3.5
+                triggerExtendedMonitoring: true,  // Kept true
+                earlyDecisionThreshold: 15        // Increased from 10 to 15
+            },
+
+            // UI settings
+            ui: {
+                width: 320,
+                height: 'auto',
+                position: {
+                    bottom: 20,
+                    right: 20
+                },
+                collapsed: false,
+                theme: 'dark'
+            },
+
+            // Sniperoo integration
+            sniperoo: {
+                addressInputSelector: 'input.Input[type="text"]',
+                submitButtonSelector: 'button[type="submit"], .submit-button, .action-button',
+                autoPaste: true,
+                autoSubmit: true
+            },
+
+            // Self-learning system
+            learning: {
+                enabled: true,
+                adaptationStrength: 0.5,          // How strongly to adapt to new data (0-1)
+                historyLimit: 1000,                // Maximum entries to keep in history
+                minSamplesForOptimization: 20     // Minimum samples before auto-optimizing
+            }
+        };
+
+        // Current configuration (start with defaults, then try to load saved config)
+        let current = loadSavedConfig() || JSON.parse(JSON.stringify(defaults));
+
+        // Helper function to load saved configuration
+        function loadSavedConfig() {
+            try {
+                const savedConfig = GM_getValue('botConfig');
+                if (savedConfig) {
+                    return JSON.parse(savedConfig);
+                }
+            } catch (error) {
+                console.error('Failed to load saved configuration:', error);
+            }
+            return null;
+        }
+
+        // Helper function to save current configuration
+        function saveConfig() {
+            try {
+                GM_setValue('botConfig', JSON.stringify(current));
+                console.log('Configuration saved successfully');
+            } catch (error) {
+                console.error('Failed to save configuration:', error);
+            }
+        }
+
+        return {
+            get: function() {
+                return current;
+            },
+
+            update: function(path, value) {
+                // Parse the path (e.g. "performance.minPriceIncrease")
+                const parts = path.split('.');
+                let target = current;
+
+                // Navigate to the nested property
+                for (let i = 0; i < parts.length - 1; i++) {
+                    if (!(parts[i] in target)) {
+                        return false;
+                    }
+                    target = target[parts[i]];
+                }
+
+                // Update the value
+                target[parts[parts.length - 1]] = value;
+
+                // Save the updated configuration
+                saveConfig();
+
+                return true;
+            },
+
+            reset: function() {
+                current = JSON.parse(JSON.stringify(defaults));
+                saveConfig();
+            },
+
+            exportConfig: function() {
+                return JSON.stringify(current, null, 2);
+            },
+
+            importConfig: function(configStr) {
+                try {
+                    const newConfig = JSON.parse(configStr);
+                    current = newConfig;
+                    saveConfig();
+                    return true;
+                } catch (error) {
+                    console.error('Failed to import configuration:', error);
+                    return false;
+                }
+            }
+        };
+    })();
+
+    /**
+     * Utility Module
+     * Provides common utility functions used throughout the application
+     */
+    const Utils = (function() {
+        return {
+            formatTime: function(seconds) {
+                const mins = Math.floor(seconds / 60);
+                const secs = Math.floor(seconds % 60);
+                return `${mins}:${secs.toString().padStart(2, '0')}`;
+            },
+
+            formatNumber: function(value, decimals = 2) {
+                return parseFloat(value).toFixed(decimals);
+            },
+
+            truncateAddress: function(address, start = 6, end = 4) {
+                if (!address || address.length <= start + end) {
+                    return address;
+                }
+                return `${address.substring(0, start)}...${address.substring(address.length - end)}`;
+            },
+
+            calculatePercentChange: function(initial, current) {
+                if (!initial || initial === 0) return 0;
+                return ((current - initial) / initial) * 100;
+            },
+
+            getCurrentTimestamp: function() {
+                return Date.now();
+            },
+
+            calculateStandardDeviation: function(values) {
+                const n = values.length;
+                if (n < 2) return 0;
+
+                // Calculate mean
+                const mean = values.reduce((sum, val) => sum + val, 0) / n;
+
+                // Calculate sum of squared differences
+                const squaredDiffs = values.map(val => Math.pow(val - mean, 2));
+                const sumSquaredDiffs = squaredDiffs.reduce((sum, val) => sum + val, 0);
+
+                // Calculate standard deviation
+                return Math.sqrt(sumSquaredDiffs / n);
+            },
+
+            // For normalizing values in ranges
+            normalize: function(value, min, max) {
+                return Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100));
+            },
+
+            // For inverse normalization (higher input = lower output)
+            normalizeInverse: function(value, min, max) {
+                return 100 - Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100));
+            },
+
+            // Generate a unique ID
+            generateId: function() {
+                return Date.now().toString(36) + Math.random().toString(36).substring(2);
+            },
+
+            // Simple debounce function
+            debounce: function(func, wait) {
+                let timeout;
+                return function executedFunction(...args) {
+                    const later = () => {
+                        clearTimeout(timeout);
+                        func(...args);
+                    };
+                    clearTimeout(timeout);
+                    timeout = setTimeout(later, wait);
+                };
+            }
+        };
+    })();
+
+    /**
+     * CreatorReputationService Module
+     * Fetches and manages reputation data for token creators
+     */
+    const CreatorReputationService = (function() {
+        // Cache for creator reputation scores
+        const reputationCache = new Map();
+        const CACHE_EXPIRY = 6 * 60 * 60 * 1000; // 6 hours
+
+        async function getCreatorScore(creatorAddress) {
+            // Validate address
+            if (!creatorAddress || typeof creatorAddress !== 'string' || creatorAddress.length < 32) {
+                console.warn('Invalid creator address:', creatorAddress);
+                return 50; // Default to neutral score
+            }
+
+            // Check cache first
+            if (reputationCache.has(creatorAddress)) {
+                const cachedData = reputationCache.get(creatorAddress);
+                if (Date.now() - cachedData.timestamp < CACHE_EXPIRY) {
+                    return cachedData.score;
+                }
+            }
+
+            try {
+                // Try to get reputation from multiple free sources
+                let score = 50; // Default neutral score
+
+                // 1. Check creator in self-learning system first
+                const creatorHistory = SelfLearningSystem.getCreatorRating(creatorAddress);
+                if (creatorHistory && creatorHistory.totalTokens > 0) {
+                    // Weight heavily since this is our own data
+                    score = 50 + (creatorHistory.successRate * 100 - 50) * 1.5;
+
+                    // If we have good data, use it directly
+                    if (creatorHistory.totalTokens >= 3) {
+                        reputationCache.set(creatorAddress, {
+                            score: score,
+                            timestamp: Date.now(),
+                            source: 'self-learning'
+                        });
+                        return score;
+                    }
+                }
+
+                // 2. Try to fetch from Solscan API (public/free tier)
+                try {
+                    const solscanResponse = await fetch(`https://public-api.solscan.io/account/${creatorAddress}`);
+                    if (solscanResponse.ok) {
+                        const solscanData = await solscanResponse.json();
+
+                        // Analyze account age and activity
+                        if (solscanData) {
+                            // Account age factor
+                            if (solscanData.openTime) {
+                                const accountAge = Date.now() - (solscanData.openTime * 1000);
+                                const ageInDays = accountAge / (24 * 60 * 60 * 1000);
+
+                                // Older accounts get up to +20 points
+                                score += Math.min(20, ageInDays / 10);
+                            }
+
+                            // Transaction count factor (if available)
+                            if (solscanData.tokenInfo && solscanData.tokenInfo.tokenAmount) {
+                                const txCount = solscanData.tokenInfo.tokenAmount.uiAmount || 0;
+                                score += Math.min(15, txCount / 50);
+                            }
+
+                            // Check for verified status
+                            if (solscanData.labels && Array.isArray(solscanData.labels)) {
+                                if (solscanData.labels.some(label =>
+                                    label.name === 'verified' ||
+                                    label.name === 'project')) {
+                                    score += 15;
+                                }
+                            }
+                        }
+                    }
+                } catch (solscanError) {
+                    console.error('Error fetching Solscan data:', solscanError);
+                }
+
+                // 3. Check Jupiter API for liquidity
+                try {
+                    const jupiterResponse = await fetch(`https://price.jup.ag/v4/price?ids=${creatorAddress}`);
+                    if (jupiterResponse.ok) {
+                        const jupiterData = await jupiterResponse.json();
+                        if (jupiterData && jupiterData.data && jupiterData.data[creatorAddress]) {
+                            // Listed on Jupiter is a good sign
+                            score += 10;
+
+                            // If it has significant volume
+                            if (jupiterData.data[creatorAddress].market_cap > 100000) {
+                                score += 10;
+                            }
+                        }
+                    }
+                } catch (jupiterError) {
+                    console.error('Error fetching Jupiter data:', jupiterError);
+                }
+
+                // Cap the score at 0-100
+                score = Math.max(0, Math.min(100, score));
+
+                // Cache the result
+                reputationCache.set(creatorAddress, {
+                    score: score,
+                    timestamp: Date.now(),
+                    source: 'api'
+                });
+
+                return score;
+            } catch (error) {
+                console.error('Error in getCreatorScore:', error);
+                return 50; // Default to neutral on error
+            }
+        }
+
+        function getDangerScore(token, creatorScore = null) {
+            // If no creator score provided, use neutral
+            const finalCreatorScore = creatorScore !== null ? creatorScore : 50;
+
+            // Define danger factors with weights
+            const dangerFactors = [
+                // Creator reputation (0-100, higher is better)
+                {
+                    factor: "creatorReputation",
+                    weight: 0.30,
+                    value: finalCreatorScore,
+                    score: Utils.normalizeInverse(finalCreatorScore, 0, 100),
+                    threshold: 40,
+                    dangerous: finalCreatorScore < 40
+                },
+
+                // Creator supply percentage (higher is more dangerous)
+                {
+                    factor: "creatorSupply",
+                    weight: 0.25,
+                    value: token.creatorSupplyPercent || 0,
+                    score: Utils.normalize(token.creatorSupplyPercent || 0, 0, 100),
+                    threshold: 70,
+                    dangerous: (token.creatorSupplyPercent || 0) > 70
+                },
+
+                // Unique buyers (higher is better)
+                {
+                    factor: "uniqueBuyers",
+                    weight: 0.15,
+                    value: token.uniqueBuyers || 0,
+                    score: Utils.normalizeInverse(token.uniqueBuyers || 0, 1, 20),
+                    threshold: 5,
+                    dangerous: (token.uniqueBuyers || 0) < 5
+                },
+
+                // Initial liquidity in USD (higher is better)
+                {
+                    factor: "initialLiquidity",
+                    weight: 0.15,
+                    value: token.initialLiquidityUSD || 0,
+                    score: Utils.normalizeInverse(token.initialLiquidityUSD || 0, 100, 10000),
+                    threshold: 3000,
+                    dangerous: (token.initialLiquidityUSD || 0) < 3000
+                },
+
+                // Age of token (newer tokens are slightly more dangerous)
+                {
+                    factor: "tokenAge",
+                    weight: 0.15,
+                    value: token.ageInSeconds || 0,
+                    score: Utils.normalizeInverse(token.ageInSeconds || 0, 0, 600),
+                    threshold: 60,
+                    dangerous: (token.ageInSeconds || 0) < 60
+                }
+            ];
+
+            // Calculate overall danger score (0-100, higher is more dangerous)
+            let totalScore = 0;
+            let totalWeight = 0;
+            const dangersDetected = [];
+
+            dangerFactors.forEach(factor => {
+                totalScore += factor.score * factor.weight;
+                totalWeight += factor.weight;
+
+                if (factor.dangerous) {
+                    dangersDetected.push({
+                        factor: factor.factor,
+                        value: factor.value,
+                        threshold: factor.threshold
+                    });
+                }
+            });
+
+            const finalDangerScore = totalWeight > 0 ? totalScore / totalWeight : 50;
+
+            // Determine danger level
+            let level = 'Low';
+            if (finalDangerScore >= 80) level = 'Extreme';
+            else if (finalDangerScore >= 65) level = 'High';
+            else if (finalDangerScore >= 45) level = 'Moderate';
+
+            return {
+                score: finalDangerScore,
+                level: level,
+                dangersDetected,
+                factors: dangerFactors
+            };
+        }
+
+        return {
+            getCreatorScore,
+            getDangerScore,
+            getCacheSize: function() {
+                return reputationCache.size;
+            },
+            clearCache: function() {
+                reputationCache.clear();
+            }
+        };
+    })();
+
+    /**
+     * DynamicAdjustment Module
+     * Handles dynamic adjustment of parameters based on market conditions
+     */
+    const DynamicAdjustment = (function() {
+        // Current market conditions
+        let marketConditions = {
+            solPrice: 100,                // Base SOL price benchmark
+            marketVolatility: 5,          // Market-wide volatility percentage
+            averageDailyVolume: 1000000,  // Average daily volume in USD
+            bullishScore: 50              // 0-100 score of market bullishness
+        };
+
+        // Flag to track if initial update has completed
+        let initialUpdateComplete = false;
+
+        function updateMarketConditions() {
+            // Fetch latest data from public APIs
+            Promise.all([
+                fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd').then(r => r.json()),
+                fetch('https://api.coingecko.com/api/v3/coins/solana/market_chart?vs_currency=usd&days=1').then(r => r.json())
+            ]).then(([priceData, chartData]) => {
+                if (priceData && priceData.solana && priceData.solana.usd) {
+                    marketConditions.solPrice = priceData.solana.usd;
+
+                    // Update SOL price in main config as well
+                    Config.update('price.solUsdPrice', priceData.solana.usd);
+                    Config.update('price.lastPriceUpdate', Date.now());
+                }
+
+                if (chartData && chartData.prices && chartData.prices.length > 0) {
+                    // Calculate volatility from price data
+                    const prices = chartData.prices.map(p => p[1]);
+                    marketConditions.marketVolatility = calculateVolatility(prices);
+
+                    // Calculate market bullishness
+                    const startPrice = prices[0];
+                    const endPrice = prices[prices.length - 1];
+                    const priceChange = ((endPrice - startPrice) / startPrice) * 100;
+
+                    // Convert price change to bullish score (0-100)
+                    // -5% or worse = 0, +5% or better = 100, linear in between
+                    marketConditions.bullishScore = Math.max(0, Math.min(100, (priceChange + 5) * 10));
+                }
+
+                console.log("Updated market conditions:", marketConditions);
+
+                // Flag first update as complete
+                initialUpdateComplete = true;
+
+                // Update parameters
+                updateDynamicFilters();
+
+            }).catch(error => {
+                console.error("Error updating market conditions:", error);
+            });
+        }
+
+        function updateDynamicFilters() {
+            const currentConfig = Config.get();
+
+            // FIXED: Better SOL price adjustment formula
+            // Instead of linear scaling with SOL price, use a more gradual adjustment
+            // This creates a smoother adjustment where changes in SOL price have less extreme effects
+            // If SOL price doubles, filters will increase by ~40% instead of 100%
+            const solPriceFactor = 1 + ((marketConditions.solPrice - 100) / 100) * 0.4;
+
+            // 2. Market volatility adjustment
+            // Higher market volatility = be more tolerant of token volatility
+            const volatilityFactor = Math.max(0.8, Math.min(1.2, marketConditions.marketVolatility / 5));
+
+            // 3. Market bullishness adjustment
+            // More bullish market = lower thresholds to catch more tokens
+            // Less bullish market = higher thresholds to be more selective
+            const bullishFactor = 1.2 - (marketConditions.bullishScore / 100) * 0.4; // Range: 0.8 to 1.2
+
+            // FIXED: Less aggressive rounding for adjustments
+            const adjustedConfig = {
+                filters: {
+                    minInitialLiquidityUSD: Math.ceil(currentConfig.filters.minInitialLiquidityUSD * solPriceFactor),
+                    minMarketCapUSD: Math.ceil(currentConfig.filters.minMarketCapUSD * solPriceFactor),
+                    maxMarketCapUSD: Math.floor(currentConfig.filters.maxMarketCapUSD * solPriceFactor)
+                },
+                performance: {
+                    maxVolatility: parseFloat((currentConfig.performance.maxVolatility * volatilityFactor).toFixed(1)),
+                    minPriceIncrease: parseFloat((currentConfig.performance.minPriceIncrease * bullishFactor).toFixed(1)),
+                    buyVsSellRatio: parseFloat((currentConfig.performance.buyVsSellRatio * bullishFactor).toFixed(2)),
+                    initialMonitorPeriod: Math.ceil(currentConfig.performance.initialMonitorPeriod / bullishFactor)
+                }
+            };
+
+            // Update configuration
+            Object.entries(adjustedConfig).forEach(([category, settings]) => {
+                Object.entries(settings).forEach(([setting, value]) => {
+                    Config.update(`${category}.${setting}`, value);
+                });
+            });
+
+            // Log dynamic adjustments
+            console.log("Applied dynamic adjustments based on market conditions:");
+            console.log(`SOL Price: $${marketConditions.solPrice.toFixed(2)} (Adjustment: ${solPriceFactor.toFixed(2)}x)`);
+            console.log(`Market Volatility: ${marketConditions.marketVolatility.toFixed(2)}% (Adjustment: ${volatilityFactor.toFixed(2)}x)`);
+            console.log(`Market Bullishness: ${marketConditions.bullishScore}/100 (Adjustment: ${bullishFactor.toFixed(2)}x)`);
+
+            // Notify UI of changes
+            notifyConfigUpdate();
+        }
+
+        function calculateVolatility(prices) {
+            if (!prices || prices.length < 2) return 5; // Default
+
+            // Calculate standard deviation of percentage changes
+            const pctChanges = [];
+            for (let i = 1; i < prices.length; i++) {
+                const pctChange = ((prices[i] - prices[i-1]) / prices[i-1]) * 100;
+                pctChanges.push(pctChange);
+            }
+
+            const mean = pctChanges.reduce((a, b) => a + b, 0) / pctChanges.length;
+            const variance = pctChanges.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / pctChanges.length;
+            return Math.sqrt(variance);
+        }
+
+        // Helper function to notify UI of config updates
+        function notifyConfigUpdate() {
+            // This is a placeholder for any UI notification system
+            // Will be implemented in the UI module
+            const updateEvent = new CustomEvent('configUpdated', {
+                detail: { source: 'dynamic', marketConditions }
+            });
+            document.dispatchEvent(updateEvent);
+        }
+
+        return {
+            init: function() {
+                // Initial update
+                updateMarketConditions();
+
+                // Set up periodic updates
+                setInterval(updateMarketConditions, 15 * 60 * 1000); // Every 15 minutes
+            },
+
+            getMarketConditions: function() {
+                return { ...marketConditions };
+            },
+
+            isInitialized: function() {
+                return initialUpdateComplete;
+            },
+
+            // Manual update function
+            forceUpdate: function() {
+                updateMarketConditions();
+            }
+        };
+    })();
+
+    /**
+     * SelfLearningSystem Module
+     * Stores token performance history and optimizes parameters based on results
+     */
+    const SelfLearningSystem = (function() {
+        // Historical performance data storage
+        let tokenPerformanceHistory = [];
+
+        // Token creator history
+        const creatorHistory = new Map();
+
+        function recordTokenOutcome(token, outcome) {
+            // Record token performance
+            const performanceData = {
+                mint: token.mint,
+                creator: token.traderPublicKey || 'unknown',
+                name: token.name || token.symbol || 'unknown',
+                initialMarketCap: token.initialMarketCap || 0,
+                finalMarketCap: token.latestMarketCap || 0,
+                marketCapChange: ((token.latestMarketCap || 0) - (token.initialMarketCap || 0)) / (token.initialMarketCap || 1) * 100,
+                initialMetrics: token.initialMetrics || {},
+                finalMetrics: token.metrics || {},
+                dangerScore: token.dangerScore || 50,
+                outcome: outcome, // 'success', 'failure', 'neutral'
+                timestamp: Date.now()
+            };
+
+            tokenPerformanceHistory.push(performanceData);
+
+            // Limit history size
+            const historyLimit = Config.get().learning.historyLimit || 1000;
+            if (tokenPerformanceHistory.length > historyLimit) {
+                tokenPerformanceHistory = tokenPerformanceHistory.slice(-historyLimit);
+            }
+
+            // Update creator history
+            if (token.traderPublicKey) {
+                if (!creatorHistory.has(token.traderPublicKey)) {
+                    creatorHistory.set(token.traderPublicKey, {
+                        address: token.traderPublicKey,
+                        tokens: [],
+                        successRate: 0,
+                        totalTokens: 0,
+                        lastUpdated: Date.now()
+                    });
+                }
+
+                const creatorData = creatorHistory.get(token.traderPublicKey);
+                creatorData.tokens.push({
+                    mint: token.mint,
+                    name: token.name || token.symbol || 'unknown',
+                    outcome: outcome,
+                    timestamp: Date.now()
+                });
+
+                // Limit tokens per creator
+                if (creatorData.tokens.length > 20) {
+                    creatorData.tokens = creatorData.tokens.slice(-20);
+                }
+
+                creatorData.totalTokens++;
+                creatorData.successRate = creatorData.tokens.filter(t => t.outcome === 'success').length / creatorData.tokens.length;
+                creatorData.lastUpdated = Date.now();
+
+                // Update whitelist/blacklist based on creator history
+                updateCreatorLists(token.traderPublicKey, creatorData);
+            }
+
+            // Save performance history
+            if (tokenPerformanceHistory.length % 10 === 0) {
+                savePerformanceHistory();
+            }
+
+            // Analyze recent data to optimize parameters
+            if (tokenPerformanceHistory.length >= Config.get().learning.minSamplesForOptimization) {
+                analyzeAndOptimizeParameters();
+            }
+        }
+
+        function updateCreatorLists(creatorAddress, creatorData) {
+            const config = Config.get();
+
+            // Only update if we have enough data
+            if (creatorData.tokens.length < 2) return;
+
+            // If creator has at least 3 tokens and >80% success rate, add to whitelist
+            if (creatorData.tokens.length >= 3 && creatorData.successRate >= 0.8) {
+                // Add to whitelist if not already there
+                if (!config.filters.whitelistedCreators.includes(creatorAddress)) {
+                    Config.update('filters.whitelistedCreators', [...config.filters.whitelistedCreators, creatorAddress]);
+                    console.log(`Added creator ${creatorAddress} to whitelist (Success rate: ${(creatorData.successRate * 100).toFixed(1)}%)`);
+                }
+
+                // Remove from blacklist if present
+                if (config.filters.blacklistedCreators.includes(creatorAddress)) {
+                    Config.update('filters.blacklistedCreators',
+                        config.filters.blacklistedCreators.filter(addr => addr !== creatorAddress));
+                }
+            }
+
+            // If creator has at least 2 tokens and <30% success rate, add to blacklist
+            if (creatorData.tokens.length >= 2 && creatorData.successRate < 0.3) {
+                // Add to blacklist if not already there
+                if (!config.filters.blacklistedCreators.includes(creatorAddress)) {
+                    Config.update('filters.blacklistedCreators', [...config.filters.blacklistedCreators, creatorAddress]);
+                    console.log(`Added creator ${creatorAddress} to blacklist (Success rate: ${(creatorData.successRate * 100).toFixed(1)}%)`);
+                }
+
+                // Remove from whitelist if present
+                if (config.filters.whitelistedCreators.includes(creatorAddress)) {
+                    Config.update('filters.whitelistedCreators',
+                        config.filters.whitelistedCreators.filter(addr => addr !== creatorAddress));
+                }
+            }
+        }
+
+        function savePerformanceHistory() {
+            // Save to GM storage
+            GM_setValue('tokenPerformanceHistory', JSON.stringify(tokenPerformanceHistory.slice(-500)));
+            GM_setValue('creatorHistory', JSON.stringify(Array.from(creatorHistory.entries())));
+            console.log(`Saved ${tokenPerformanceHistory.length} token performance records and ${creatorHistory.size} creator records`);
+        }
+
+        function loadPerformanceHistory() {
+            try {
+                const savedPerformance = GM_getValue('tokenPerformanceHistory');
+                if (savedPerformance) {
+                    tokenPerformanceHistory = JSON.parse(savedPerformance);
+                }
+
+                const savedCreatorHistory = GM_getValue('creatorHistory');
+                if (savedCreatorHistory) {
+                    const creatorEntries = JSON.parse(savedCreatorHistory);
+                    creatorEntries.forEach(([address, data]) => {
+                        creatorHistory.set(address, data);
+                    });
+                }
+
+                console.log(`Loaded ${tokenPerformanceHistory.length} historical token performances and ${creatorHistory.size} creator records`);
+            } catch (error) {
+                console.error('Error loading performance history:', error);
+                // Initialize with empty arrays if load fails
+                tokenPerformanceHistory = [];
+            }
+        }
+
+        function analyzeAndOptimizeParameters() {
+            // Only proceed if learning is enabled
+            if (!Config.get().learning.enabled) {
+                return;
+            }
+
+            // Get recent data (last 50 tokens or less)
+            const recentData = tokenPerformanceHistory.slice(-50);
+
+            // Calculate success rate with current parameters
+            const successRate = recentData.filter(token => token.outcome === 'success').length / recentData.length;
+
+            console.log(`Current success rate: ${(successRate * 100).toFixed(1)}%`);
+
+            // Analyze tokens that failed despite low danger scores
+            const falseSafes = recentData.filter(token => token.outcome === 'failure' && token.dangerScore < 50);
+
+            // Analyze tokens that succeeded despite high danger scores
+            const falseAlarms = recentData.filter(token => token.outcome === 'success' && token.dangerScore > 70);
+
+            // Determine adjustment strength
+            const adaptationStrength = Config.get().learning.adaptationStrength;
+
+            // If we have significant false safes, increase our strictness
+            if (falseSafes.length >= 3) {
+                const config = Config.get();
+
+                // Make filters slightly stricter
+                Config.update('filters.minInitialLiquidityUSD', Math.round(config.filters.minInitialLiquidityUSD * (1 + 0.1 * adaptationStrength)));
+                Config.update('filters.minUniqueBuyers', Math.min(8, config.filters.minUniqueBuyers + adaptationStrength));
+                Config.update('filters.maxDangerScore', Math.max(50, config.filters.maxDangerScore - 5 * adaptationStrength));
+
+                console.log('Adjusted parameters to be more strict based on false safe analysis');
+            }
+
+            // If we have significant false alarms, reduce our strictness
+            if (falseAlarms.length >= 3 && successRate < 0.4) {
+                const config = Config.get();
+
+                // Make filters slightly more lenient
+                Config.update('filters.minInitialLiquidityUSD', Math.round(config.filters.minInitialLiquidityUSD * (1 - 0.1 * adaptationStrength)));
+                Config.update('filters.maxDangerScore', Math.min(80, config.filters.maxDangerScore + 5 * adaptationStrength));
+
+                console.log('Adjusted parameters to be more lenient based on false alarm analysis');
+            }
+
+            // Send notification about parameter optimization
+            if (falseSafes.length >= 3 || (falseAlarms.length >= 3 && successRate < 0.4)) {
+                GM_notification({
+                    text: `Parameters automatically optimized based on ${tokenPerformanceHistory.length} tokens (${(successRate * 100).toFixed(1)}% success rate)`,
+                    title: 'Self-Learning System',
+                    timeout: 5000
+                });
+            }
+        }
+
+        return {
+            init: function() {
+                loadPerformanceHistory();
+            },
+
+            recordSuccess: function(token) {
+                recordTokenOutcome(token, 'success');
+            },
+
+            recordFailure: function(token) {
+                recordTokenOutcome(token, 'failure');
+            },
+
+            recordNeutral: function(token) {
+                recordTokenOutcome(token, 'neutral');
+            },
+
+            getCreatorRating: function(creatorAddress) {
+                if (!creatorHistory.has(creatorAddress)) return null;
+
+                const creatorData = creatorHistory.get(creatorAddress);
+                return {
+                    successRate: creatorData.successRate,
+                    totalTokens: creatorData.totalTokens,
+                    lastUpdated: creatorData.lastUpdated
+                };
+            },
+
+            getStats: function() {
+                return {
+                    totalTokensTracked: tokenPerformanceHistory.length,
+                    creatorsTracked: creatorHistory.size,
+                    successRate: tokenPerformanceHistory.length > 0 ?
+                        tokenPerformanceHistory.filter(t => t.outcome === 'success').length / tokenPerformanceHistory.length : 0,
+                    whitelistedCreators: Config.get().filters.whitelistedCreators.length,
+                    blacklistedCreators: Config.get().filters.blacklistedCreators.length
+                };
+            },
+
+            // For debugging and manual analysis
+            getHistoryData: function() {
+                return {
+                    tokens: [...tokenPerformanceHistory],
+                    creators: Array.from(creatorHistory.entries())
+                };
+            },
+
+            // Force a save
+            forceSave: function() {
+                savePerformanceHistory();
+            },
+
+            // Clear history
+            clearHistory: function() {
+                if (confirm('Are you sure you want to clear all learning history? This cannot be undone.')) {
+                    tokenPerformanceHistory = [];
+                    creatorHistory.clear();
+                    savePerformanceHistory();
+                    return true;
+                }
+                return false;
+            }
+        };
+    })();
+
+    /**
+     * TokenStore Module
+     * Manages token tracking, monitoring, and performance evaluation
+     */
+    const TokenStore = (function() {
+        // Private variables
+        const monitoredTokens = new Map(); // Maps token mint address to monitoring data
+        const processedTokens = new Set(); // Set of processed token addresses
+
+        // Private methods
+        function calculatePerformanceMetrics(data) {
+            const token = data.token;
+            const trades = data.trades;
+
+            // Calculate market cap change
+            const marketCapChange = data.latestMarketCap - data.initialMarketCap;
+            const marketCapChangePercent = Utils.calculatePercentChange(
+                data.initialMarketCap, data.latestMarketCap
+            );
+
+            // Calculate buy vs sell ratio
+            let buyCount = 0;
+            let sellCount = 0;
+
+            trades.forEach(trade => {
+                if (trade.txType === 'buy') buyCount++;
+                else if (trade.txType === 'sell') sellCount++;
+            });
+
+            const buyToSellRatio = sellCount > 0 ? buyCount / sellCount : buyCount > 0 ? Infinity : 0;
+
+            // Calculate trade rate (trades per minute)
+            const monitoringDuration = (Date.now() - data.startTime) / 1000 / 60; // in minutes
+            const tradeRate = trades.length / Math.max(monitoringDuration, 0.1); // avoid division by zero
+
+            // Calculate unique buyer count
+            const uniqueBuyers = new Set();
+            trades.filter(t => t.txType === 'buy' && t.buyer).forEach(t => uniqueBuyers.add(t.buyer));
+            const uniqueBuyerCount = uniqueBuyers.size;
+
+            // Calculate initial buy velocity (buys per minute in first 30 seconds)
+            const initialBuys = trades.filter(t => {
+                const tradeTime = t.timestamp || 0;
+                const timeSinceStart = (tradeTime - data.startTime) / 1000;
+                return t.txType === 'buy' && timeSinceStart <= 30;
+            });
+
+            let initialBuyVelocity = 0;
+            if (initialBuys.length >= 2) {
+                const firstBuyTime = initialBuys[0].timestamp || data.startTime;
+                const lastBuyTime = initialBuys[initialBuys.length - 1].timestamp || data.startTime + 30000;
+                const durationMinutes = Math.max(0.1, (lastBuyTime - firstBuyTime) / (1000 * 60));
+                initialBuyVelocity = initialBuys.length / durationMinutes;
+            }
+
+            // Calculate price volatility
+            let volatility = 0;
+            if (trades.length >= 3) {
+                const prices = trades.filter(t => t.price).map(t => t.price);
+                if (prices.length >= 3) {
+                    // Calculate percentage changes between consecutive prices
+                    const priceChanges = [];
+                    for (let i = 1; i < prices.length; i++) {
+                        const percentChange = Utils.calculatePercentChange(prices[i-1], prices[i]);
+                        priceChanges.push(Math.abs(percentChange)); // Use absolute value for volatility
+                    }
+
+                    // Volatility is the standard deviation of price changes
+                    volatility = Utils.calculateStandardDeviation(priceChanges);
+                }
+            }
+
+            // Detect growth pattern (steady stair-stepping vs vertical spikes)
+            let isSteppedGrowth = false;
+            const steppedGrowthThreshold = Config.get().performance.steppedGrowthThreshold;
+
+            if (trades.length >= 4) {
+                const prices = trades.filter(t => t.price).map(t => t.price);
+                if (prices.length >= 4) {
+                    let steadyIncreases = 0;
+                    let spikeIncreases = 0;
+
+                    for (let i = 1; i < prices.length; i++) {
+                        const percentChange = Utils.calculatePercentChange(prices[i-1], prices[i]);
+                        if (percentChange > 0) {
+                            if (percentChange <= steppedGrowthThreshold) {
+                                steadyIncreases++;
+                            } else {
+                                spikeIncreases++;
+                            }
+                        }
+                    }
+
+                    const totalIncreases = steadyIncreases + spikeIncreases;
+                    isSteppedGrowth = totalIncreases > 0 &&
+                                     (steadyIncreases / totalIncreases) >= 0.6; // 60% or more are steady increases
+                }
+            }
+
+            return {
+                marketCapChangePercent,
+                buyCount,
+                sellCount,
+                buyToSellRatio,
+                tradeRate,
+                tradeCount: trades.length,
+                uniqueBuyerCount,
+                initialBuyVelocity,
+                volatility,
+                isSteppedGrowth
+            };
+        }
+
+        // Public interface
+        return {
+            startMonitoring: async function(token) {
+                // Exit early if token is already processed or being monitored
+                if (processedTokens.has(token.mint)) {
+                    console.log(`Token already processed, skipping: ${token.name || token.symbol || token.mint}`);
+                    return false;
+                }
+
+                if (monitoredTokens.has(token.mint)) {
+                    console.log(`Token already being monitored, skipping: ${token.name || token.symbol || token.mint}`);
+                    return false;
+                }
+
+                // Calculate token age
+                let ageInSeconds = 0;
+                if (token.client_timestamp) {
+                    const creationTime = new Date(token.client_timestamp).getTime();
+                    ageInSeconds = (Date.now() - creationTime) / 1000;
+                    token.ageInSeconds = ageInSeconds;
+                }
+
+                // Calculate liquidity (if available)
+                if (token.solAmount !== undefined) {
+                    const solUsdPrice = Config.get().price.solUsdPrice;
+                    token.initialLiquidityUSD = token.solAmount * solUsdPrice;
+                }
+
+                // Get creator reputation score asynchronously
+                try {
+                    const creatorScore = await CreatorReputationService.getCreatorScore(token.traderPublicKey);
+                    token.creatorScore = creatorScore;
+
+                    // Calculate danger score
+                    const dangerAssessment = CreatorReputationService.getDangerScore(token, creatorScore);
+                    token.dangerScore = dangerAssessment.score;
+                    token.dangerAssessment = dangerAssessment;
+
+                    console.log(`Token ${token.name || token.symbol || token.mint} danger score: ${dangerAssessment.score.toFixed(1)} (${dangerAssessment.level})`);
+                } catch (error) {
+                    console.error('Error getting reputation data:', error);
+                    // Default values if reputation check fails
+                    token.creatorScore = 50;
+                    token.dangerScore = 50;
+                    token.dangerAssessment = { score: 50, level: 'Moderate', dangersDetected: [] };
+                }
+
+                const monitoringData = {
+                    token: token,
+                    startTime: Date.now(),
+                    trades: [],
+                    initialMarketCap: token.marketCapSol || 0,
+                    latestMarketCap: token.marketCapSol || 0,
+                    phase: 'initial', // 'initial' or 'extended'
+                    endTime: Date.now() + (Config.get().performance.initialMonitorPeriod * 1000)
+                };
+
+                // Store initial metrics
+                monitoringData.initialMetrics = { timestamp: Date.now() };
+
+                monitoredTokens.set(token.mint, monitoringData);
+                processedTokens.add(token.mint);
+
+                console.log(`Started monitoring token: ${token.name || token.symbol || token.mint} (${Utils.truncateAddress(token.mint)})`);
+
+                // Notify user
+                GM_notification({
+                    text: `Started monitoring: ${token.name || token.symbol || token.mint}`,
+                    title: 'Token Monitoring',
+                    timeout: 3000
+                });
+
+                return true;
+            },
+
+            recordTrade: function(tradeData) {
+                const tokenMint = tradeData.mint;
+                if (!monitoredTokens.has(tokenMint)) {
+                    return false;
+                }
+
+                const monitoringData = monitoredTokens.get(tokenMint);
+
+                // Add timestamp to trade data if not present
+                if (!tradeData.timestamp) {
+                    tradeData.timestamp = Date.now();
+                }
+
+                monitoringData.trades.push(tradeData);
+                monitoringData.latestMarketCap = tradeData.marketCapSol || monitoringData.latestMarketCap;
+
+                console.log(`Recorded trade for ${Utils.truncateAddress(tokenMint)}: ${tradeData.txType}, MarketCap: ${tradeData.marketCapSol} SOL`);
+
+                // Check for early decision conditions
+                const performance = Config.get().performance;
+                const metrics = calculatePerformanceMetrics(monitoringData);
+
+                // Store metrics in monitoring data
+                monitoringData.metrics = metrics;
+
+                // If token is performing exceptionally well, submit it immediately
+                if (metrics.marketCapChangePercent >= performance.earlyDecisionThreshold &&
+                    metrics.tradeCount >= performance.minTradeCount &&
+                    metrics.buyToSellRatio >= performance.buyVsSellRatio &&
+                    metrics.volatility <= performance.maxVolatility) {
+
+                    console.log(`Token ${Utils.truncateAddress(tokenMint)} triggered early decision with ${metrics.marketCapChangePercent.toFixed(2)}% increase!`);
+
+                    // Add metrics to token data
+                    monitoringData.token.metrics = metrics;
+
+                    // Record success in self-learning system
+                    SelfLearningSystem.recordSuccess(monitoringData.token);
+
+                    // Remove from monitoring and submit
+                    monitoredTokens.delete(tokenMint);
+
+                    // Notify user
+                    GM_notification({
+                        text: `Early decision: ${monitoringData.token.name || monitoringData.token.symbol || tokenMint} (+${metrics.marketCapChangePercent.toFixed(2)}%)`,
+                        title: 'Token Approved',
+                        timeout: 5000
+                    });
+
+                    // Send to Sniperoo
+                    GM_setValue('tokenToSniperoo', monitoringData.token);
+
+                    // Tell WebSocket manager to unsubscribe
+                    return { action: 'unsubscribe', mint: tokenMint };
+                }
+
+                return true;
+            },
+
+            evaluatePerformance: function(tokenMint) {
+                if (!monitoredTokens.has(tokenMint)) {
+                    return false;
+                }
+
+                const data = monitoredTokens.get(tokenMint);
+                const performance = Config.get().performance;
+                const metrics = calculatePerformanceMetrics(data);
+
+                // Store latest metrics
+                data.metrics = metrics;
+
+                console.log(`Evaluating token ${data.token.name || data.token.symbol || tokenMint} (${Utils.truncateAddress(tokenMint)})`);
+                console.log(`- Trades: ${metrics.tradeCount} (${metrics.buyCount} buys, ${metrics.sellCount} sells)`);
+                console.log(`- Market cap change: ${metrics.marketCapChangePercent.toFixed(2)}%`);
+                console.log(`- Buy/Sell ratio: ${metrics.buyToSellRatio.toFixed(2)}`);
+                console.log(`- Unique buyers: ${metrics.uniqueBuyerCount}`);
+                console.log(`- Initial buy velocity: ${metrics.initialBuyVelocity.toFixed(2)} buys/min`);
+                console.log(`- Price volatility: ${metrics.volatility.toFixed(2)}%`);
+                console.log(`- Growth pattern: ${metrics.isSteppedGrowth ? 'Stepped' : 'Spiky'}`);
+
+                // Check if current phase is completed
+                const currentTime = Date.now();
+                const phaseCompleted = currentTime >= data.endTime;
+
+                if (!phaseCompleted) {
+                    // Still monitoring
+                    return null;
+                }
+
+                // Store metrics in token object
+                data.token.metrics = metrics;
+
+                // Make decision based on current phase
+                if (data.phase === 'initial') {
+                    // First phase finished, decide whether to extend monitoring or take action
+                    const performanceGood = metrics.marketCapChangePercent >= performance.minPriceIncrease &&
+                                           metrics.tradeCount >= performance.minTradeCount &&
+                                           metrics.buyToSellRatio >= performance.buyVsSellRatio &&
+                                           metrics.volatility <= performance.maxVolatility &&
+                                           (!performance.preferSteppedGrowth || metrics.isSteppedGrowth);
+
+                    if (performanceGood) {
+                        // Good performance, send to Sniperoo
+                        monitoredTokens.delete(tokenMint);
+
+                        // Record success in self-learning system
+                        SelfLearningSystem.recordSuccess(data.token);
+
+                        console.log(`✅ Token ${Utils.truncateAddress(tokenMint)} passed performance check! Sending to Sniperoo.`);
+                        GM_notification({
+                            text: `Token ${data.token.name || data.token.symbol || tokenMint} passed performance check (+${metrics.marketCapChangePercent.toFixed(2)}%)`,
+                            title: 'Token Passed',
+                            timeout: 5000
+                        });
+
+                        // Send to Sniperoo
+                        GM_setValue('tokenToSniperoo', data.token);
+                        return { action: 'unsubscribe', mint: tokenMint };
+                    } else if (performance.triggerExtendedMonitoring) {
+                        // Poor performance, extend monitoring
+                        data.phase = 'extended';
+                        data.endTime = currentTime + (performance.extendedMonitorPeriod * 1000);
+
+                        console.log(`⏳ Token ${Utils.truncateAddress(tokenMint)} underperforming, extending monitoring for ${performance.extendedMonitorPeriod} seconds.`);
+                        GM_notification({
+                            text: `Extended monitoring for ${data.token.name || data.token.symbol || tokenMint} (${metrics.marketCapChangePercent.toFixed(2)}%)`,
+                            title: 'Monitoring Extended',
+                            timeout: 3000
+                        });
+
+                        return { action: 'continue', mint: tokenMint };
+                    } else {
+                        // Skip extended monitoring, reject token
+                        monitoredTokens.delete(tokenMint);
+
+                        // Record failure in self-learning system
+                        SelfLearningSystem.recordFailure(data.token);
+
+                        console.log(`❌ Token ${Utils.truncateAddress(tokenMint)} failed performance check. Unsubscribing.`);
+                        return { action: 'unsubscribe', mint: tokenMint };
+                    }
+                } else if (data.phase === 'extended') {
+                    // Extended monitoring phase finished
+                    monitoredTokens.delete(tokenMint);
+
+                    const performanceGood = metrics.marketCapChangePercent >= performance.minPriceIncrease &&
+                                           metrics.tradeCount >= performance.minTradeCount &&
+                                           metrics.buyToSellRatio >= performance.buyVsSellRatio &&
+                                           metrics.volatility <= performance.maxVolatility &&
+                                           (!performance.preferSteppedGrowth || metrics.isSteppedGrowth);
+
+                    if (performanceGood) {
+                        // Token improved during extended monitoring
+                        // Record success in self-learning system
+                        SelfLearningSystem.recordSuccess(data.token);
+
+                        console.log(`✅ Token ${Utils.truncateAddress(tokenMint)} passed extended monitoring! Sending to Sniperoo.`);
+                        GM_notification({
+                            text: `Token ${data.token.name || data.token.symbol || tokenMint} passed extended monitoring (+${metrics.marketCapChangePercent.toFixed(2)}%)`,
+                            title: 'Token Passed',
+                            timeout: 5000
+                        });
+
+                        // Send to Sniperoo
+                        GM_setValue('tokenToSniperoo', data.token);
+                        return { action: 'unsubscribe', mint: tokenMint };
+                    } else {
+                        // Token still underperforming after extended monitoring
+                        // Record failure in self-learning system
+                        SelfLearningSystem.recordFailure(data.token);
+
+                        console.log(`❌ Token ${Utils.truncateAddress(tokenMint)} failed extended monitoring. Discarding.`);
+                        GM_notification({
+                            text: `Token ${data.token.name || data.token.symbol || tokenMint} failed extended monitoring (${metrics.marketCapChangePercent.toFixed(2)}%)`,
+                            title: 'Token Failed',
+                            timeout: 3000
+                        });
+                        return { action: 'unsubscribe', mint: tokenMint };
+                    }
+                }
+
+                return { action: 'continue', mint: tokenMint };
+            },
+
+            // Check all monitored tokens for evaluation
+            checkMonitoredTokens: function() {
+                const actions = [];
+
+                for (const [tokenMint, data] of monitoredTokens.entries()) {
+                    if (Date.now() >= data.endTime) {
+                        const result = this.evaluatePerformance(tokenMint);
+                        if (result) {
+                            actions.push(result);
+                        }
+                    }
+                }
+
+                return actions;
+            },
+
+            getMonitoredTokens: function() {
+                return monitoredTokens;
+            },
+
+            getProcessedCount: function() {
+                return processedTokens.size;
+            },
+
+            getMonitoredCount: function() {
+                return monitoredTokens.size;
+            },
+
+            getMonitoredTokenMetrics: function() {
+                const result = [];
+
+                for (const [mint, data] of monitoredTokens.entries()) {
+                    const metrics = calculatePerformanceMetrics(data);
+                    const bondingCurveKey = data.token.bondingCurveKey || '';
+
+                    result.push({
+                        mint,
+                        name: data.token.name || data.token.symbol || mint,
+                        timeLeft: Math.max(0, Math.floor((data.endTime - Date.now()) / 1000)),
+                        phase: data.phase,
+                        metrics,
+                        bondingCurveKey,
+                        dangerAssessment: data.token.dangerAssessment || { score: 50, level: 'Moderate', dangersDetected: [] }
+                    });
+                }
+
+                return result;
+            }
+        };
+    })();
+
+    /**
+     * WebSocketManager Module
+     * Handles WebSocket connection, subscriptions, and message processing
+     */
+    const WebSocketManager = (function() {
+        // Private variables
+        let ws = null;
+        let reconnectAttempts = 0;
+        let isConnected = false;
+        const activeSubscriptions = new Set();
+        const buyersByToken = new Map(); // Maps token mint to set of buyers
+        const initialBuysByToken = new Map(); // Maps token mint to array of initial buys (for velocity checking)
+
+        // Token filtering functionality
+        async function filterToken(token) {
+            const filters = Config.get().filters;
+
+            // Skip already processed tokens
+            if (TokenStore.getProcessedCount() > 0) {
+                // Implementation detail: we don't have direct access to the Set
+                // But TokenStore will avoid duplicates internally
+            }
+
+            // Check creation time (if timestamp is available)
+            if (token.client_timestamp) {
+                const creationTime = new Date(token.client_timestamp).getTime();
+                const ageInSeconds = (Date.now() - creationTime) / 1000;
+
+                // Add age to token for danger score calculation
+                token.ageInSeconds = ageInSeconds;
+
+                if (ageInSeconds > filters.maxTimeFromCreation) {
+                    console.log(`Token too old: ${ageInSeconds.toFixed(0)} seconds`);
+                    return false;
+                }
+            }
+
+            // Apply market cap filters with dynamic adjustment based on SOL price
+            if (token.marketCapSol !== undefined) {
+                const price = Config.get().price;
+                const marketCapUSD = token.marketCapSol * price.solUsdPrice;
+
+                if (marketCapUSD < filters.minMarketCapUSD) {
+                    console.log(`Market cap too low: ${marketCapUSD.toFixed(2)} USD (${token.marketCapSol.toFixed(2)} SOL)`);
+                    return false;
+                }
+                if (marketCapUSD > filters.maxMarketCapUSD) {
+                    console.log(`Market cap too high: ${marketCapUSD.toFixed(2)} USD (${token.marketCapSol.toFixed(2)} SOL)`);
+                    return false;
+                }
+            }
+
+            // Apply whitelist filter if configured
+            if (filters.whitelistedCreators.length > 0 &&
+                !filters.whitelistedCreators.includes(token.traderPublicKey)) {
+                console.log(`Creator not whitelisted: ${token.traderPublicKey}`);
+                return true;
+            }
+
+            // Apply blacklist filter
+            if (filters.blacklistedCreators.includes(token.traderPublicKey)) {
+                console.log(`Creator blacklisted: ${token.traderPublicKey}`);
+                return false;
+            }
+
+            // Filter by initial liquidity if available
+            if (token.initialBuy !== undefined && token.solAmount !== undefined) {
+                // Approximate initial liquidity value
+                const initialLiquiditySOL = token.solAmount;
+                const estimatedUSD = initialLiquiditySOL * Config.get().price.solUsdPrice;
+                token.initialLiquidityUSD = estimatedUSD;
+
+                if (estimatedUSD < filters.minInitialLiquidityUSD) {
+                    console.log(`Initial liquidity too low: $${estimatedUSD.toFixed(2)}`);
+                    return false;
+                }
+            }
+
+            // Check for unusual supply distribution if available
+            if (token.creatorSupplyPercent !== undefined && token.creatorSupplyPercent > filters.maxCreatorSupplyPercent) {
+                console.log(`Creator holds too much supply: ${token.creatorSupplyPercent.toFixed(2)}% > ${filters.maxCreatorSupplyPercent}%`);
+                return false;
+            }
+
+            // Check for unique buyer count if we have that data
+            if (filters.minUniqueBuyers > 0 && buyersByToken.has(token.mint)) {
+                const uniqueBuyers = buyersByToken.get(token.mint).size;
+                token.uniqueBuyers = uniqueBuyers;
+
+                if (uniqueBuyers < filters.minUniqueBuyers) {
+                    console.log(`Not enough unique buyers: ${uniqueBuyers} < ${filters.minUniqueBuyers}`);
+                    return false;
+                }
+            }
+
+            // Check for initial buy velocity if we have that data
+            if (filters.initialBuyVelocity > 0 && initialBuysByToken.has(token.mint)) {
+                const initialBuys = initialBuysByToken.get(token.mint);
+                if (initialBuys.length >= 2) {
+                    const firstBuyTime = initialBuys[0].timestamp;
+                    const lastBuyTime = initialBuys[initialBuys.length - 1].timestamp;
+                    const durationMinutes = Math.max(0.1, (lastBuyTime - firstBuyTime) / (1000 * 60));
+                    const velocity = initialBuys.length / durationMinutes;
+
+                    token.initialBuyVelocity = velocity;
+
+                    if (velocity < filters.initialBuyVelocity) {
+                        console.log(`Initial buy velocity too low: ${velocity.toFixed(2)} buys/min < ${filters.initialBuyVelocity}`);
+                        return false;
+                    }
+                }
+            }
+
+            // Get creator reputation and calculate danger score
+            try {
+                const creatorScore = await CreatorReputationService.getCreatorScore(token.traderPublicKey);
+                token.creatorScore = creatorScore;
+
+                // Calculate danger score
+                const dangerAssessment = CreatorReputationService.getDangerScore(token, creatorScore);
+                token.dangerScore = dangerAssessment.score;
+                token.dangerAssessment = dangerAssessment;
+
+                // Apply danger score filter
+                if (token.dangerScore > filters.maxDangerScore) {
+                    console.log(`Danger score too high: ${token.dangerScore.toFixed(1)} > ${filters.maxDangerScore} (${dangerAssessment.level})`);
+                    return false;
+                }
+            } catch (error) {
+                console.error('Error calculating danger score:', error);
+                // Don't filter out if the calculation fails
+            }
+
+            return true;
+        }
+
+        // Message handling
+        function handleMessage(data) {
+            // Check if the message is a success confirmation message
+            if (data.message && data.message.includes('Successfully subscribed')) {
+                console.log('Subscription successful:', data.message);
+                return;
+            }
+
+            // Handle trade data
+            if (data.txType && data.mint) {
+                if (data.txType === 'create') {
+                    processNewToken(data);
+                } else if (['buy', 'sell'].includes(data.txType)) {
+                    // Track unique buyers for this token
+                    if (data.txType === 'buy' && data.buyer) {
+                        if (!buyersByToken.has(data.mint)) {
+                            buyersByToken.set(data.mint, new Set());
+                        }
+                        buyersByToken.get(data.mint).add(data.buyer);
+                    }
+
+                    // Track initial buys for velocity calculation
+                    if (data.txType === 'buy') {
+                        const tokenCreationTime = data.creationTime || (Date.now() - 60000); // Assume 1 minute ago if not available
+                        const timeSinceCreation = (Date.now() - tokenCreationTime) / 1000;
+
+                        if (timeSinceCreation <= 30) { // Only track first 30 seconds
+                            if (!initialBuysByToken.has(data.mint)) {
+                                initialBuysByToken.set(data.mint, []);
+                            }
+
+                            initialBuysByToken.get(data.mint).push({
+                                buyer: data.buyer || 'unknown',
+                                timestamp: Date.now()
+                            });
+                        }
+                    }
+
+                    processTokenTrade(data);
+                }
+            }
+        }
+
+        async function processNewToken(data) {
+            console.log('New token detected:', data.mint, data.name || data.symbol);
+
+            // Apply initial filters to check if we should monitor this token
+            if (await filterToken(data)) {
+                console.log('Token passed initial filters, starting monitoring:', data.mint);
+
+                // Store bondingCurveKey if available
+                if (data.bondingCurveKey) {
+                    console.log(`Bonding curve key for ${data.mint}: ${data.bondingCurveKey}`);
+                    data.bondingCurveKey = data.bondingCurveKey;
+                }
+
+                const started = await TokenStore.startMonitoring(data);
+
+                if (started) {
+                    // Subscribe to trades for this token
+                    subscribe('subscribeTokenTrade', [data.mint]);
+                }
+            } else {
+                console.log('Token did not pass initial filters:', data.mint);
+            }
+        }
+
+        function processTokenTrade(data) {
+            // Record trade data for monitored tokens
+            const result = TokenStore.recordTrade(data);
+
+            // If the token store returns an unsubscribe action, perform it
+            if (result && typeof result === 'object' && result.action === 'unsubscribe') {
+                subscribe('unsubscribeTokenTrade', [result.mint]);
+            }
+        }
+
+        // Public interface
+        return {
+            connect: function() {
+                try {
+                    const config = Config.get().ws;
+                    ws = new WebSocket(config.url);
+
+                    ws.onopen = () => {
+                        console.log('Connected to PumpPortal WebSocket');
+                        isConnected = true;
+                        reconnectAttempts = 0;
+
+                        // Subscribe to new token events
+                        this.subscribe('subscribeNewToken');
+
+                        // Notify user
+                        GM_notification({
+                            text: 'Connected to PumpPortal WebSocket',
+                            title: 'Token Monitor Active',
+                            timeout: 3000
+                        });
+                    };
+
+                    ws.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        handleMessage(data);
+                    };
+
+                    ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        isConnected = false;
+                    };
+
+                    ws.onclose = () => {
+                        console.log('WebSocket connection closed');
+                        isConnected = false;
+                        this.reconnect();
+                    };
+                } catch (error) {
+                    console.error('Failed to connect to WebSocket:', error);
+                    this.reconnect();
+                }
+            },
+
+            subscribe: function(method, keys) {
+                subscribe(method, keys);
+            },
+
+            reconnect: function() {
+                const config = Config.get().ws;
+                if (reconnectAttempts >= config.maxReconnectAttempts) {
+                    console.error('Max reconnection attempts reached');
+                    return;
+                }
+
+                reconnectAttempts++;
+                console.log(`Attempting to reconnect (${reconnectAttempts}/${config.maxReconnectAttempts})...`);
+
+                setTimeout(() => {
+                    this.connect();
+
+                    // Re-subscribe to active subscriptions after reconnection
+                    if (isConnected) {
+                        this.resubscribe();
+                    }
+                }, config.reconnectDelay);
+            },
+
+            resubscribe: function() {
+                const subscriptionsByMethod = {};
+
+                // Group subscriptions by method
+                for (const sub of activeSubscriptions) {
+                    const [method, key] = sub.split(':');
+                    if (!subscriptionsByMethod[method]) {
+                        subscriptionsByMethod[method] = [];
+                    }
+                    if (key) {
+                        subscriptionsByMethod[method].push(key);
+                    }
+                }
+
+                // Re-subscribe to each method
+                for (const [method, keys] of Object.entries(subscriptionsByMethod)) {
+                    if (keys.length > 0) {
+                        this.subscribe(method, keys);
+                    } else {
+                        this.subscribe(method);
+                    }
+                }
+            },
+
+            disconnect: function() {
+                if (ws) {
+                    ws.close();
+                    isConnected = false;
+                }
+            },
+
+            getConnectionStatus: function() {
+                return isConnected;
+            },
+
+            processTokenStore: function() {
+                const actions = TokenStore.checkMonitoredTokens();
+
+                // Process any subscription changes from token evaluation
+                actions.forEach(action => {
+                    if (action.action === 'unsubscribe') {
+                        this.subscribe('unsubscribeTokenTrade', [action.mint]);
+                    }
+                });
+            },
+
+            // For debugging/test purposes
+            getTrackingData: function() {
+                return {
+                    buyersByToken: buyersByToken,
+                    initialBuysByToken: initialBuysByToken
+                };
+            }
+        };
+
+        // Private helper function for subscribe
+        function subscribe(method, keys) {
+            if (!isConnected || !ws) {
+                console.warn('Cannot subscribe, WebSocket not connected');
+                return;
+            }
+
+            const payload = { method };
+            if (keys) payload.keys = keys;
+
+            try {
+                ws.send(JSON.stringify(payload));
+                console.log(`Sent subscription: ${method}${keys ? ' for ' + keys.join(', ') : ''}`);
+
+                // Track subscriptions
+                if (method.startsWith('subscribe') && keys) {
+                    keys.forEach(key => {
+                        activeSubscriptions.add(`${method}:${key}`);
+                    });
+                } else if (method.startsWith('unsubscribe') && keys) {
+                    keys.forEach(key => {
+                        activeSubscriptions.delete(`${method.replace('unsubscribe', 'subscribe')}:${key}`);
+                    });
+                } else if (method.startsWith('subscribe')) {
+                    activeSubscriptions.add(method);
+                } else if (method.startsWith('unsubscribe')) {
+                    activeSubscriptions.delete(method.replace('unsubscribe', 'subscribe'));
+                }
+            } catch (error) {
+                console.error('Failed to send subscription:', error);
+            }
+        }
+    })();
+
+    /**
+     * SniperooIntegration Module
+     * Handles the integration with Sniperoo app
+     */
+    const SniperooIntegration = (function() {
+        function submitTokenToSniperoo(token) {
+            if (!token || !token.mint) return false;
+
+            const config = Config.get().sniperoo;
+
+            // Check if auto-paste is enabled
+            if (!config.autoPaste) {
+                console.log(`Auto-paste is disabled, not sending token ${token.name || token.symbol || token.mint} to Sniperoo`);
+                GM_notification({
+                    text: `Token passed checks but auto-paste is disabled: ${token.name || token.symbol || token.mint}`,
+                    title: 'Token Approved - Auto-Paste Disabled',
+                    timeout: 3000
+                });
+                return false;
+            }
+
+            // Find the address input field using the more specific selector
+            const inputFields = document.querySelectorAll(config.addressInputSelector);
+
+            if (inputFields.length > 0) {
+                const inputField = inputFields[0];
+
+                // Only update if the field is empty or has a different value
+                if (!inputField.value || inputField.value !== token.mint) {
+                    console.log(`Found input field for Sniperoo, attempting to set value to: ${token.mint}`);
+
+                    // Set the address value
+                    inputField.value = token.mint;
+
+                    // Dispatch events to ensure the site's JavaScript detects the change
+                    // Use a broader range of events to increase chances of success
+                    const events = ['input', 'change', 'keyup', 'blur'];
+                    events.forEach(eventType => {
+                        inputField.dispatchEvent(new Event(eventType, { bubbles: true }));
+                    });
+
+                    // Try to find the parent element that might have event listeners
+                    const parentElement = inputField.closest('.flex-grow.inline-grid');
+                    if (parentElement) {
+                        events.forEach(eventType => {
+                            parentElement.dispatchEvent(new Event(eventType, { bubbles: true }));
+                        });
+                    }
+
+                    console.log(`Token address pasted into Sniperoo: ${token.mint}`);
+
+                    // Optional: Click submit button if configured
+                    if (config.autoSubmit && config.submitButtonSelector) {
+                        setTimeout(() => {
+                            // Try multiple submit button selectors
+                            const selectors = [
+                                config.submitButtonSelector,
+                                'button:not([disabled])',
+                                'button.primary-button',
+                                'button.svelte-button',
+                                'button:contains("Submit")',
+                                'button:contains("Enter")',
+                                'button.Button',
+                                'button'
+                            ];
+
+                            let submitButton = null;
+                            for (const selector of selectors) {
+                                try {
+                                    const buttons = document.querySelectorAll(selector);
+                                    if (buttons.length > 0) {
+                                        // Find a button that looks like a submit button
+                                        for (const btn of buttons) {
+                                            const text = btn.textContent.toLowerCase();
+                                            if (text.includes('submit') || text.includes('enter') ||
+                                                text.includes('search') || text.includes('check') ||
+                                                text.includes('go')) {
+                                                submitButton = btn;
+                                                break;
+                                            }
+                                        }
+
+                                        // If no specific submit text was found, use the first button
+                                        if (!submitButton && buttons.length > 0) {
+                                            submitButton = buttons[0];
+                                        }
+
+                                        if (submitButton) break;
+                                    }
+                                } catch (e) {
+                                    // Some selectors might be invalid, ignore errors
+                                    console.log(`Error with selector ${selector}:`, e.message);
+                                }
+                            }
+
+                            if (submitButton) {
+                                console.log('Found submit button, clicking:', submitButton);
+                                submitButton.click();
+
+                                GM_notification({
+                                    text: `Token submitted to Sniperoo: ${token.name || token.symbol || token.mint}`,
+                                    title: 'Token Submitted',
+                                    timeout: 3000
+                                });
+                            } else {
+                                console.log('Submit button not found with any selector');
+
+                                // Just notify that the address was pasted
+                                GM_notification({
+                                    text: `Token address pasted into Sniperoo: ${token.name || token.symbol || token.mint}`,
+                                    title: 'Address Pasted',
+                                    timeout: 3000
+                                });
+                            }
+                        }, 500);
+                    } else {
+                        // Just notify that the address was pasted (no auto-submit)
+                        GM_notification({
+                            text: `Token address pasted into Sniperoo: ${token.name || token.symbol || token.mint}`,
+                            title: 'Address Pasted',
+                            timeout: 3000
+                        });
+                    }
+
+                    return true;
+                }
+            } else {
+                console.error('Input field not found using selector:', config.addressInputSelector);
+
+                // Fallback to try other common selectors
+                const fallbackSelectors = [
+                    'input[type="text"]',
+                    '.Input',
+                    'input',
+                    'textarea'
+                ];
+
+                for (const selector of fallbackSelectors) {
+                    const elements = document.querySelectorAll(selector);
+                    if (elements.length > 0) {
+                        console.log(`Found ${elements.length} potential input fields using fallback selector: ${selector}`);
+
+                        // Try to use the first input field as a fallback
+                        const inputField = elements[0];
+                        inputField.value = token.mint;
+                        inputField.dispatchEvent(new Event('input', { bubbles: true }));
+                        inputField.dispatchEvent(new Event('change', { bubbles: true }));
+
+                        GM_notification({
+                            text: `Attempted fallback paste for: ${token.name || token.symbol || token.mint}`,
+                            title: 'Fallback Paste Attempted',
+                            timeout: 3000
+                        });
+
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        return {
+            setup: function() {
+                // Listen for tokens to send to Sniperoo
+                GM_addValueChangeListener('tokenToSniperoo', function(name, oldValue, newValue) {
+                    submitTokenToSniperoo(newValue);
+                });
+
+                console.log('Sniperoo integration setup complete');
+            }
+        };
+    })();
+
+    /**
+     * UI Module
+     * Handles the user interface for the token monitor
+     */
+    const UI = (function() {
+        // UI elements
+        let elements = {};
+        let isResizing = false;
+        let startX, startY, startWidth, startHeight;
+
+        // Add modern styles
+        function addModernStyles() {
+            const styleElement = document.createElement('style');
+            styleElement.id = 'pump-monitor-styles';
+            styleElement.innerHTML = `
+
+                /* Custom font import for enhanced typography */
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+                #pump-monitor-ui * {
+                    box-sizing: border-box;
+                    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    scrollbar-width: thin;
+                    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+                }
+/* Responsive UI Scaling */
+#pump-monitor-ui {
+    width: 380px !important;  /* Fixed width */
+    max-width: 95vw !important;  /* Ensure it fits on smaller screens */
+    min-width: 320px !important;  /* Minimum width to prevent breaking */
+    max-height: 90vh !important;
+    font-size: clamp(12px, 1vw + 0.5rem, 16px);  /* Responsive font scaling */
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.2) transparent;
+    transition: all 0.3s ease;
+}
+
+/* Responsive scaling for different elements */
+#pump-monitor-ui .section-card {
+    margin-bottom: clamp(8px, 1vh, 16px);
+}
+
+#pump-monitor-ui .section-header {
+    padding: clamp(10px, 1.5vh, 15px);
+    font-size: clamp(13px, 1vw + 0.4rem, 15px);
+}
+
+#pump-monitor-ui .section-content {
+    padding: clamp(10px, 1.5vh, 15px);
+}
+
+#pump-monitor-ui .pm-btn {
+    padding: clamp(6px, 1vh, 10px) clamp(10px, 1.5vw, 14px);
+    font-size: clamp(11px, 1vw + 0.3rem, 13px);
+}
+
+#pump-monitor-ui .pm-input {
+    padding: clamp(6px, 1vh, 8px) clamp(8px, 1.5vw, 10px);
+    font-size: clamp(11px, 1vw + 0.3rem, 13px);
+}
+
+/* Add more responsive scaling for other elements as needed */
+
+/* Responsive adjustments for very small screens */
+@media (max-width: 400px) {
+    #pump-monitor-ui {
+        width: 95vw !important;
+        font-size: 12px;
+    }
+
+    #pump-monitor-ui .section-header {
+        padding: 8px;
+    }
+
+    #pump-monitor-ui .section-content {
+        padding: 8px;
+    }
+}
+
+/* Scaling for larger screens */
+@media (min-width: 1200px) {
+    #pump-monitor-ui {
+        right: 20px !important;
+        bottom: 20px !important;
+    }
+}#pump-monitor-ui #monitor-ui-content {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    overflow-y: auto;  /* Explicitly add scroll */
+    max-height: calc(90vh - 42px);
+    padding-right: 8px;  /* Add padding to make room for scrollbar */
+}
+
+#pump-monitor-ui #monitor-ui-content::-webkit-scrollbar {
+    width: 8px;
+    background-color: rgba(0,0,0,0.1);
+}
+
+#pump-monitor-ui #monitor-ui-content::-webkit-scrollbar-track {
+    background: rgba(0,0,0,0.1);
+    border-radius: 10px;
+}
+
+#pump-monitor-ui #monitor-ui-content::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 10px;
+}
+
+/* Ensure parent containers have overflow handling */
+#pump-monitor-ui {
+    overflow-y: auto !important;
+    max-height: 90vh !important;
+    height: auto !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.2) transparent;
+}
+
+#pump-monitor-ui::-webkit-scrollbar {
+    width: 8px;
+    background-color: rgba(0,0,0,0.1);
+}
+
+#pump-monitor-ui::-webkit-scrollbar-track {
+    background: rgba(0,0,0,0.1);
+    border-radius: 10px;
+}
+
+#pump-monitor-ui::-webkit-scrollbar-thumb {
+    background-color: rgba(255,255,255,0.2);
+    border-radius: 10px;
+}
+
+/* Ensure content can scroll */
+#pump-monitor-ui > div {
+    max-height: none !important;
+    height: auto !important;
+}
+
+#pump-monitor-ui .section-content {
+    max-height: 300px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+}
+
+#pump-monitor-ui .section-content::-webkit-scrollbar {
+    width: 6px;
+    background-color: rgba(0,0,0,0.1);
+}
+
+#pump-monitor-ui .section-content::-webkit-scrollbar-track {
+    background: rgba(0,0,0,0.1);
+    border-radius: 10px;
+}
+
+#pump-monitor-ui .section-content::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 10px;
+}
+                #pump-monitor-ui {
+                    /* Refined Color Palette with Softer Transitions */
+                    --bg: #131721;
+                    --card-bg: #1c2331;
+                    --primary: #4ecdc4;
+                    --secondary: #8a79af;
+                    --success: #32d74b;
+                    --warning: #ffd700;
+                    --danger: #ff453a;
+                    --text-primary: #e0e3e7;
+                    --text-secondary: #8c94a3;
+                    --border: #2c3445;
+                    --highlight: #1f2937;
+                    --shadow: rgba(0, 0, 0, 0.35);
+
+                    background: linear-gradient(145deg, var(--bg), #0f1217);
+                    color: var(--text-primary);
+                    box-shadow: 0 15px 35px var(--shadow), 0 5px 15px rgba(0,0,0,0.2);
+                    border-radius: 16px;
+                    overflow: hidden;
+                    backdrop-filter: blur(10px);
+                }
+
+                #pump-monitor-ui .section-card {
+                    background: var(--card-bg);
+                    border-radius: 12px;
+                    margin-bottom: 12px;
+                    overflow: hidden;
+                    border: 1px solid var(--border);
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    transform: translateY(0);
+                }
+
+                #pump-monitor-ui .section-card:hover {
+                    transform: translateY(-3px);
+                    box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+                }
+
+                #pump-monitor-ui .section-header {
+                    padding: 12px 15px;
+                    font-weight: 600;
+                    font-size: 15px;
+                    border-bottom: 1px solid var(--border);
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    background: linear-gradient(135deg, var(--highlight), var(--card-bg));
+                }
+
+                #pump-monitor-ui .section-content {
+                    padding: 15px;
+                }
+
+                #pump-monitor-ui .pm-badge {
+                    display: inline-block;
+                    padding: 3px 10px;
+                    border-radius: 16px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }
+
+                #pump-monitor-ui .pm-badge-success {
+                    background-color: rgba(50, 215, 75, 0.2);
+                    color: var(--success);
+                    border: 1px solid rgba(50, 215, 75, 0.3);
+                }
+                #pump-monitor-ui .pm-badge-warning {
+                    background-color: rgba(255, 215, 0, 0.2);
+                    color: var(--warning);
+                    border: 1px solid rgba(255, 215, 0, 0.3);
+                }
+                #pump-monitor-ui .pm-badge-danger {
+                    background-color: rgba(255, 69, 58, 0.2);
+                    color: var(--danger);
+                    border: 1px solid rgba(255, 69, 58, 0.3);
+                }
+                #pump-monitor-ui .pm-badge-primary {
+                    background-color: rgba(78, 205, 196, 0.2);
+                    color: var(--primary);
+                    border: 1px solid rgba(78, 205, 196, 0.3);
+                }
+                #pump-monitor-ui .pm-badge-secondary {
+                    background-color: rgba(138, 121, 175, 0.2);
+                    color: var(--secondary);
+                    border: 1px solid rgba(138, 121, 175, 0.3);
+                }
+
+                #pump-monitor-ui .pm-btn {
+                    background: var(--highlight);
+                    color: var(--text-primary);
+                    border: 1px solid var(--border);
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    font-size: 13px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                }
+
+                #pump-monitor-ui .pm-btn:hover {
+                    background: var(--border);
+                    border-color: var(--primary);
+                    transform: translateY(-2px);
+                }
+
+                #pump-monitor-ui .pm-btn-success {
+                    background: linear-gradient(135deg, var(--success), #2ac769);
+                    color: white;
+                    border-color: var(--success);
+                }
+                #pump-monitor-ui .pm-btn-danger {
+                    background: linear-gradient(135deg, var(--danger), #ff1a4b);
+                    color: white;
+                    border-color: var(--danger);
+                }
+
+                #pump-monitor-ui .pm-input {
+                    background: rgba(0,0,0,0.15);
+                    border: 1px solid var(--border);
+                    color: var(--text-primary);
+                    border-radius: 6px;
+                    padding: 8px 10px;
+                    font-size: 13px;
+                    transition: all 0.2s ease;
+                }
+
+                #pump-monitor-ui .pm-input:focus {
+                    outline: none;
+                    border-color: var(--primary);
+                    box-shadow: 0 0 0 3px rgba(78, 205, 196, 0.15);
+                }
+
+                #pump-monitor-ui .pm-checkbox {
+                    width: 18px;
+                    height: 18px;
+                    accent-color: var(--primary);
+                    border-radius: 4px;
+                    border: 1px solid var(--border);
+                }
+
+                #pump-monitor-ui .token-item {
+                    padding: 15px;
+                    border-bottom: 1px solid var(--border);
+                    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                    cursor: pointer;
+                    position: relative;
+                    overflow: hidden;
+                }
+
+                #pump-monitor-ui .token-item::before {
+                    content: '';
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: linear-gradient(135deg, transparent, rgba(78, 205, 196, 0.05));
+                    opacity: 0;
+                    transition: opacity 0.3s ease;
+                    pointer-events: none;
+                }
+
+                #pump-monitor-ui .token-item:hover::before {
+                    opacity: 1;
+                }
+
+                #pump-monitor-ui .token-item:hover {
+                    transform: scale(1.02);
+                    box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                    z-index: 10;
+                }
+
+                #pump-monitor-ui .token-item:last-child {
+                    border-bottom: none;
+                }
+
+                #pump-monitor-ui .pm-flex {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    gap: 10px;
+                }
+
+                #pump-monitor-ui .pm-mt-1 { margin-top: 8px; }
+                #pump-monitor-ui .pm-mt-2 { margin-top: 12px; }
+
+                #pump-monitor-ui .pm-status-dot {
+                    display: inline-block;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 50%;
+                    margin-right: 8px;
+                    box-shadow: 0 0 8px rgba(0,0,0,0.2);
+                }
+
+                #pump-monitor-ui .pm-status-dot-online {
+                    background: linear-gradient(135deg, var(--success), #2ac769);
+                    animation: pulse-online 2s infinite;
+                }
+
+                #pump-monitor-ui .pm-status-dot-offline {
+                    background: linear-gradient(135deg, var(--danger), #ff1a4b);
+                    animation: pulse-offline 2s infinite;
+                }
+
+                @keyframes pulse-online {
+                    0%, 100% { transform: scale(1); opacity: 1; }
+                    50% { transform: scale(1.1); opacity: 0.7; }
+                }
+
+                @keyframes pulse-offline {
+                    0%, 100% { transform: scale(1); opacity: 1; }
+                    50% { transform: scale(1.1); opacity: 0.7; }
+                }
+
+                #pump-monitor-ui .pm-scrollable {
+                    max-height: 300px;
+                    overflow-y: auto;
+                    scrollbar-width: thin;
+                    scrollbar-color: var(--border) transparent;
+                    padding-right: 5px;
+                }
+
+                #pump-monitor-ui .pm-scrollable::-webkit-scrollbar {
+                    width: 8px;
+                }
+
+                #pump-monitor-ui .pm-scrollable::-webkit-scrollbar-track {
+                    background: transparent;
+                    border-radius: 10px;
+                }
+
+                #pump-monitor-ui .pm-scrollable::-webkit-scrollbar-thumb {
+                    background-color: var(--border);
+                    border-radius: 10px;
+                    transition: background-color 0.3s ease;
+                }
+
+                #pump-monitor-ui .pm-scrollable::-webkit-scrollbar-thumb:hover {
+                    background-color: var(--primary);
+                }
+
+                #pump-monitor-ui .pm-modal {
+                    background: linear-gradient(145deg, var(--card-bg), var(--bg));
+                    border-radius: 16px;
+                    box-shadow:
+                        0 25px 50px rgba(0,0,0,0.3),
+                        0 10px 20px rgba(0,0,0,0.2);
+                    border: 1px solid var(--border);
+                    animation: pm-modal-in 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                    max-width: 90vw;
+                    width: 500px;
+                }
+
+                @keyframes pm-modal-in {
+                    from {
+                        opacity: 0;
+                        transform: translate(-50%, -48%) scale(0.9);
+                    }
+                    to {
+                        opacity: 1;
+                        transform: translate(-50%, -50%) scale(1);
+                    }
+                }
+
+                #pump-monitor-ui .pm-progress-bar {
+                    background: rgba(255,255,255,0.1);
+                    border-radius: 6px;
+                    height: 8px;
+                    overflow: hidden;
+                    margin-top: 8px;
+                    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+                }
+
+                #pump-monitor-ui .pm-progress-bar-inner {
+                    height: 100%;
+                    transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+                }
+
+                /* Responsive adjustments */
+                @media (max-width: 600px) {
+                    #pump-monitor-ui {
+                        width: 95vw !important;
+                        max-width: 95vw !important;
+                        right: 2.5vw !important;
+                    }
+
+                    #pump-monitor-ui .section-content {
+                        padding: 10px;
+                    }
+
+                    #pump-monitor-ui .pm-btn {
+                        padding: 6px 10px;
+                        font-size: 11px;
+                    }
+                }
+            `;
+            document.head.appendChild(styleElement);
+
+
+        }
+
+        function createUI() {
+            // Only create control UI on sniperoo
+            if (!window.location.href.includes('sniperoo.app')) return;
+
+            // Add modern styles first
+            addModernStyles();
+
+            const uiConfig = Config.get().ui;
+
+
+
+
+const uiContainer = document.createElement('div');
+uiContainer.id = 'pump-monitor-ui';
+uiContainer.style.position = 'fixed';
+uiContainer.style.bottom = `${uiConfig.position.bottom}px`;
+uiContainer.style.right = `${uiConfig.position.right}px`;
+uiContainer.style.zIndex = '9999';
+uiContainer.style.backgroundColor = 'var(--bg)';
+uiContainer.style.padding = '0';
+uiContainer.style.borderRadius = '12px';
+uiContainer.style.width = `${uiConfig.width}px`;
+uiContainer.style.maxHeight = '90vh';  // Limit to 90% of viewport height
+uiContainer.style.overflow = 'hidden';  // Hide overflow
+uiContainer.style.resize = 'both';  // Allow manual resizing
+uiContainer.style.boxShadow = '0 10px 25px rgba(0,0,0,0.3)';
+
+            // Main UI content
+            uiContainer.innerHTML =
+                `<div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 15px; border-bottom: 1px solid var(--border);">
+        <!-- Existing header content -->
+    </div>
+    <div id="monitor-ui-content" style="
+        padding: 12px;
+        max-height: calc(90vh - 42px);
+        overflow-y: auto;
+        overflow-x: hidden;
+    ">
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 15px; border-bottom: 1px solid var(--border);">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+                        </svg>
+                        <h3 style="margin: 0; font-size: 15px; font-weight: 600;">Pump.fun AI Monitor</h3>
+                    </div>
+                    <button id="toggle-monitor-ui" style="background: none; border: none; color: var(--text-primary); cursor: pointer;">▼</button>
+                </div>
+                <div id="monitor-ui-content" style="
+    padding: 12px;
+    max-height: calc(90vh - 42px);
+    overflow-y: auto;
+    overflow-x: hidden;
+">
+    <!-- Existing content remains the same -->
+</div>
+                                    <span id="connection-status">
+                                        <span class="pm-status-dot pm-status-dot-offline"></span>
+                                        Disconnected
+                                    </span>
+                                </div>
+                                <div class="pm-badge pm-badge-primary" id="monitored-count-badge">0</div>
+                            </div>
+                            <div class="pm-flex pm-mt-2" style="gap: 8px;">
+                                <button id="connect-ws" class="pm-btn pm-btn-success" style="flex: 1;">Connect</button>
+                                <button id="disconnect-ws" class="pm-btn pm-btn-danger" style="flex: 1;">Disconnect</button>
+                                <button id="reset-settings" class="pm-btn" style="flex: 1;">Reset</button>
+                                <button id="manual-filter-btn" class="pm-btn" style="flex: 1;">Config</button>
+                            </div>
+
+                            <div class="pm-flex pm-mt-2" style="align-items: flex-start;">
+                                <label style="display: flex; align-items: center; font-size: 13px;">
+                                    <input type="checkbox" id="auto-paste" class="pm-checkbox" checked>
+                                    <span style="margin-left: 6px;">Auto-paste to Sniperoo</span>
+                                </label>
+                                <div id="market-conditions-badge" class="pm-badge pm-badge-secondary"
+                                    style="margin-top: 2px;" title="Market conditions">Neutral</div>
+                            </div>
+                            <div class="pm-flex pm-mt-1" style="font-size: 12px; color: var(--text-secondary);">
+                                <span>SOL: $<span id="sol-price-value">0.00</span></span>
+                                <span>Updated: <span id="sol-price-time">Never</span></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="section-card">
+                        <div class="section-header">
+                            <span>Filter Settings</span>
+                            <button id="toggle-filter-settings" style="background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 16px;">+</button>
+                        </div>
+                        <div id="filter-settings-content" class="section-content" style="display: none;">
+                            ${createFilterSettingsContent()}
+                        </div>
+                    </div>
+
+                    <div class="section-card">
+                        <div class="section-header">
+                            <span>Performance Settings</span>
+                            <button id="toggle-performance-settings" style="background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 16px;">+</button>
+                        </div>
+                        <div id="performance-settings-content" class="section-content" style="display: none;">
+                            ${createPerformanceSettingsContent()}
+                        </div>
+                    </div>
+
+                    <div class="section-card">
+                        <div class="section-header">
+                            <span>AI Learning System</span>
+                            <button id="toggle-learning-settings" style="background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 16px;">+</button>
+                        </div>
+                        <div id="learning-settings-content" class="section-content" style="display: none;">
+                            ${createLearningSystemContent()}
+                        </div>
+                    </div>
+
+                    <div class="section-card">
+                        <div class="section-header">
+                            <span>Monitored Tokens</span>
+                            <button id="toggle-monitored-list" style="background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 16px;">+</button>
+                        </div>
+                        <div id="monitored-tokens-list" class="section-content pm-scrollable" style="display: none; padding: 0;">
+                            <div style="padding: 12px; color: var(--text-secondary); font-style: italic; font-size: 12px; text-align: center;">
+                                No tokens being monitored
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Manual filter dialog -->
+                <div id="manual-filter-dialog" class="pm-modal" style="display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 0; z-index: 10000; width: 450px; max-width: 90vw;">
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid var(--border);">
+                        <h3 style="margin: 0; font-size: 16px; font-weight: 600;">Advanced Configuration</h3>
+                        <button id="close-filter-dialog" style="background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 18px;">&times;</button>
+                    </div>
+                    <div id="manual-filter-content" style="max-height: 70vh; overflow-y: auto; padding: 15px;">
+                        <!-- Will be populated dynamically -->
+                    </div>
+                    <div style="padding: 15px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end;">
+                        <button id="save-manual-filters" class="pm-btn pm-btn-primary">Save Changes</button>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(uiContainer);
+
+            // Add resize handle
+            const resizeHandle = document.createElement('div');
+            resizeHandle.style.position = 'absolute';
+            resizeHandle.style.width = '15px';
+            resizeHandle.style.height = '15px';
+            resizeHandle.style.bottom = '0';
+            resizeHandle.style.right = '0';
+            resizeHandle.style.cursor = 'nwse-resize';
+            resizeHandle.style.background = 'transparent';
+            resizeHandle.id = 'pump-monitor-resize-handle';
+
+            uiContainer.appendChild(resizeHandle);
+
+            setupResizeEvents(uiContainer, resizeHandle);
+
+            return uiContainer;
+        }
+
+        function createFilterSettingsContent() {
+            const filters = Config.get().filters;
+
+            return `
+                <div class="pm-form-group">
+                    <label for="min-market-cap">Min Market Cap (USD):</label>
+                    <input type="number" id="min-market-cap" class="pm-input" min="0" value="${filters.minMarketCapUSD}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="max-market-cap">Max Market Cap (USD):</label>
+                    <input type="number" id="max-market-cap" class="pm-input" min="0" value="${filters.maxMarketCapUSD}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="min-liquidity">Min Liquidity (USD):</label>
+                    <input type="number" id="min-liquidity" class="pm-input" min="0" value="${filters.minInitialLiquidityUSD}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="max-age">Max Age (seconds):</label>
+                    <input type="number" id="max-age" class="pm-input" min="0" value="${filters.maxTimeFromCreation}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="min-unique-buyers">Min Unique Buyers:</label>
+                    <input type="number" id="min-unique-buyers" class="pm-input" min="0" value="${filters.minUniqueBuyers}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="initial-buy-velocity">Min Buy Velocity (per min):</label>
+                    <input type="number" id="initial-buy-velocity" class="pm-input" min="0" step="0.1" value="${filters.initialBuyVelocity}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="max-creator-supply">Max Creator Supply (%):</label>
+                    <input type="number" id="max-creator-supply" class="pm-input" min="0" max="100" value="${filters.maxCreatorSupplyPercent}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="max-danger-score">Max Danger Score (0-100):</label>
+                    <input type="number" id="max-danger-score" class="pm-input" min="0" max="100" value="${filters.maxDangerScore}">
+                </div>
+            `;
+        }
+
+        function createPerformanceSettingsContent() {
+            const performance = Config.get().performance;
+
+            return `
+                <div class="pm-form-group">
+                    <label for="min-price-increase">Min Price Increase (%):</label>
+                    <input type="number" id="min-price-increase" class="pm-input" min="0" max="100" value="${performance.minPriceIncrease}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="min-trade-count">Min Trades:</label>
+                    <input type="number" id="min-trade-count" class="pm-input" min="1" max="100" value="${performance.minTradeCount}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="buy-sell-ratio">Min Buy/Sell Ratio:</label>
+                    <input type="number" id="buy-sell-ratio" class="pm-input" min="0" step="0.1" value="${performance.buyVsSellRatio}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="early-threshold">Early Decision Threshold (%):</label>
+                    <input type="number" id="early-threshold" class="pm-input" min="0" value="${performance.earlyDecisionThreshold}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="initial-period">Initial Monitor Period (s):</label>
+                    <input type="number" id="initial-period" class="pm-input" min="5" value="${performance.initialMonitorPeriod}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="extended-period">Extended Monitor Period (s):</label>
+                    <input type="number" id="extended-period" class="pm-input" min="5" value="${performance.extendedMonitorPeriod}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="max-volatility">Max Volatility (%):</label>
+                    <input type="number" id="max-volatility" class="pm-input" min="0" value="${performance.maxVolatility}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="prefer-stepped">Prefer Stepped Growth:</label>
+                    <input type="checkbox" id="prefer-stepped" class="pm-checkbox" ${performance.preferSteppedGrowth ? 'checked' : ''}>
+                </div>
+                <div class="pm-form-group">
+                    <label for="stepped-threshold">Stepped Growth Threshold (%):</label>
+                    <input type="number" id="stepped-threshold" class="pm-input" min="0" max="100" value="${performance.steppedGrowthThreshold}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="use-extended">Use Extended Monitoring:</label>
+                    <input type="checkbox" id="use-extended" class="pm-checkbox" ${performance.triggerExtendedMonitoring ? 'checked' : ''}>
+                </div>
+            `;
+        }
+
+        function createLearningSystemContent() {
+            const learning = Config.get().learning;
+
+            return `
+                <div class="pm-form-group">
+                    <label for="learning-enabled">Enable Self-Learning:</label>
+                    <input type="checkbox" id="learning-enabled" class="pm-checkbox" ${learning.enabled ? 'checked' : ''}>
+                </div>
+                <div class="pm-form-group">
+                    <label for="adaptation-strength">Adaptation Strength (0-1):</label>
+                    <input type="number" id="adaptation-strength" class="pm-input" min="0" max="1" step="0.1" value="${learning.adaptationStrength}">
+                </div>
+                <div class="pm-form-group">
+                    <label for="min-samples">Min Samples for Optimization:</label>
+                    <input type="number" id="min-samples" class="pm-input" min="5" value="${learning.minSamplesForOptimization}">
+                </div>
+
+                <div style="background: rgba(0,0,0,0.15); padding: 10px; border-radius: 8px; margin-top: 12px; border: 1px solid var(--border);">
+                    <div id="learning-stats" style="font-size: 12px; color: var(--text-secondary);">
+                        <div class="pm-flex pm-mb-1">
+                            <span>Tokens Tracked:</span>
+                            <span id="tokens-tracked">0</span>
+                        </div>
+                        <div class="pm-flex pm-mb-1">
+                            <span>Success Rate:</span>
+                            <span id="success-rate">0%</span>
+                        </div>
+                        <div class="pm-flex">
+                            <span>Creators:</span>
+                            <span><span id="creators-tracked">0</span> (<span id="whitelist-count">0</span> ✓, <span id="blacklist-count">0</span> ✗)</span>
+                        </div>
+                    </div>
+                    <div class="pm-flex" style="margin-top: 8px; gap: 8px;">
+                        <button id="save-learning-data" class="pm-btn pm-btn-success" style="flex: 1;">Save Data</button>
+                        <button id="clear-learning-data" class="pm-btn pm-btn-danger" style="flex: 1;">Clear Data</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function createManualFilterContent() {
+            const config = Config.get();
+
+            // Create content for all settings
+            return `
+                <div style="margin-bottom: 20px;">
+                    <h4 style="margin: 0 0 12px 0; font-size: 15px; color: var(--primary);">Whitelist & Blacklist</h4>
+
+                    <div style="margin-bottom: 12px;">
+                        <label for="whitelist-creators" style="display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-secondary);">Whitelisted Creators (comma separated):</label>
+                        <textarea id="whitelist-creators" style="width: 100%; height: 60px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 8px 10px; font-size: 12px;">${config.filters.whitelistedCreators.join(',')}</textarea>
+                    </div>
+
+                    <div style="margin-bottom: 12px;">
+                        <label for="blacklist-creators" style="display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-secondary);">Blacklisted Creators (comma separated):</label>
+                        <textarea id="blacklist-creators" style="width: 100%; height: 60px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 8px 10px; font-size: 12px;">${config.filters.blacklistedCreators.join(',')}</textarea>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <h4 style="margin: 0 0 12px 0; font-size: 15px; color: var(--primary);">Advanced Filters</h4>
+
+                    <div class="pm-form-group">
+                        <label for="manual-max-supply">Max Token Supply:</label>
+                        <input type="number" id="manual-max-supply" class="pm-input" value="${config.filters.maxSupply}" style="width: 120px;">
+                    </div>
+
+                    <div class="pm-form-group">
+                        <label for="manual-exclude-nsfw">Exclude NSFW token names:</label>
+                        <input type="checkbox" id="manual-exclude-nsfw" class="pm-checkbox" ${config.filters.excludeNSFWNames ? 'checked' : ''}>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 20px;">
+                    <h4 style="margin: 0 0 12px 0; font-size: 15px; color: var(--primary);">Sniperoo Integration</h4>
+
+                    <div class="pm-form-group">
+                        <label for="manual-auto-submit">Auto-submit after pasting address:</label>
+                        <input type="checkbox" id="manual-auto-submit" class="pm-checkbox" ${config.sniperoo.autoSubmit ? 'checked' : ''}>
+                    </div>
+
+                    <div style="margin-bottom: 12px;">
+                        <label for="manual-submit-selector" style="display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-secondary);">Submit Button Selector:</label>
+                        <input type="text" id="manual-submit-selector" class="pm-input" value="${config.sniperoo.submitButtonSelector}" style="width: 100%;">
+                    </div>
+
+                    <div style="margin-bottom: 12px;">
+                        <label for="manual-input-selector" style="display: block; margin-bottom: 6px; font-size: 13px; color: var(--text-secondary);">Address Input Selector:</label>
+                        <input type="text" id="manual-input-selector" class="pm-input" value="${config.sniperoo.addressInputSelector}" style="width: 100%;">
+                    </div>
+                </div>
+
+                <div>
+                    <h4 style="margin: 0 0 12px 0; font-size: 15px; color: var(--primary);">Export/Import Configuration</h4>
+
+                    <div style="margin-bottom: 10px; display: flex; gap: 8px;">
+                        <button id="export-config" class="pm-btn" style="flex: 1;">Export Config</button>
+                        <button id="import-config" class="pm-btn" style="flex: 1;">Import Config</button>
+                    </div>
+
+                    <div id="export-import-area" style="display: none; margin-top: 12px;">
+                        <textarea id="config-json" style="width: 100%; height: 120px; background: rgba(0,0,0,0.2); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 8px 10px; font-size: 12px;"></textarea>
+                        <div style="display: flex; justify-content: flex-end; margin-top: 8px; gap: 8px;">
+                            <button id="copy-config" class="pm-btn">Copy</button>
+                            <button id="apply-import" class="pm-btn pm-btn-success" style="display: none;">Apply Import</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function setupResizeEvents(container, resizeHandle) {
+            // Setup resize events
+            resizeHandle.addEventListener('mousedown', function(e) {
+                isResizing = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                startWidth = parseInt(document.defaultView.getComputedStyle(container).width, 10);
+                startHeight = parseInt(document.defaultView.getComputedStyle(container).height, 10);
+
+                document.documentElement.addEventListener('mousemove', doResize);
+                document.documentElement.addEventListener('mouseup', stopResize);
+
+                e.preventDefault();
+            });
+
+            function doResize(e) {
+                if (!isResizing) return;
+
+                const width = startWidth + e.clientX - startX;
+                const height = startHeight + e.clientY - startY;
+
+                // Apply minimum size constraints
+                if (width >= 320) {
+                    container.style.width = width + 'px';
+                    Config.update('ui.width', width);
+                }
+
+                if (height >= 200) {
+                    container.style.height = height + 'px';
+                    Config.update('ui.height', height);
+                }
+            }
+
+            function stopResize() {
+                isResizing = false;
+                document.documentElement.removeEventListener('mousemove', doResize);
+                document.documentElement.removeEventListener('mouseup', stopResize);
+            }
+        }
+
+        function setupEventListeners() {
+            // Common toggle functionality
+            function setupToggle(buttonId, contentId) {
+                const button = document.getElementById(buttonId);
+                const content = document.getElementById(contentId);
+
+                if (button && content) {
+                    button.addEventListener('click', function() {
+                        if (content.style.display === 'none') {
+                            content.style.display = 'block';
+                            button.textContent = '−';  // Use minus sign instead of Hide
+                        } else {
+                            content.style.display = 'none';
+                            button.textContent = '+';  // Use plus sign instead of Show
+                        }
+                    });
+                }
+            }
+document.querySelectorAll('.section-header').forEach(header => {
+        const toggleButton = header.querySelector('button[id^="toggle-"]');
+
+        if (toggleButton) {
+            // Special handling for monitored tokens
+            const contentId = toggleButton.id === 'toggle-monitored-list'
+                ? 'monitored-tokens-list'
+                : toggleButton.id.replace('toggle-', '') + '-content';
+
+            const content = document.getElementById(contentId);
+
+            if (content) {
+                header.addEventListener('click', function(event) {
+                    // Prevent triggering if clicking directly on the button
+                    if (event.target === toggleButton) return;
+
+                    if (content.style.display === 'none') {
+                        content.style.display = 'block';
+                        toggleButton.textContent = '−';
+                    } else {
+                        content.style.display = 'none';
+                        toggleButton.textContent = '+';
+                    }
+                });
+            }
+        }
+    });
+            // Main UI toggle
+            const toggleUI = document.getElementById('toggle-monitor-ui');
+            const uiContent = document.getElementById('monitor-ui-content');
+
+            if (toggleUI && uiContent) {
+                toggleUI.addEventListener('click', function() {
+                    if (uiContent.style.display === 'none') {
+                        uiContent.style.display = 'block';
+                        toggleUI.textContent = '▼';
+                        Config.update('ui.collapsed', false);
+                    } else {
+                        uiContent.style.display = 'none';
+                        toggleUI.textContent = '▲';
+                        Config.update('ui.collapsed', true);
+                    }
+                });
+
+                // Apply saved collapsed state
+                if (Config.get().ui.collapsed) {
+                    uiContent.style.display = 'none';
+                    toggleUI.textContent = '▲';
+                }
+            }
+
+            // Reset settings button
+            const resetSettingsButton = document.getElementById('reset-settings');
+            if (resetSettingsButton) {
+                resetSettingsButton.addEventListener('click', function() {
+                    if (confirm('Are you sure you want to reset all settings to default values?')) {
+                        Config.reset();
+
+                        // Notify user
+                        GM_notification({
+                            text: 'All settings have been reset to defaults',
+                            title: 'Settings Reset',
+                            timeout: 3000
+                        });
+
+                        // Reload page to reflect new settings
+                        setTimeout(() => location.reload(), 1000);
+                    }
+                });
+            }
+
+            // Manual filter button
+            const manualFilterBtn = document.getElementById('manual-filter-btn');
+            const manualFilterDialog = document.getElementById('manual-filter-dialog');
+            const closeFilterDialog = document.getElementById('close-filter-dialog');
+            const saveManualFilters = document.getElementById('save-manual-filters');
+
+            if (manualFilterBtn && manualFilterDialog) {
+                manualFilterBtn.addEventListener('click', function() {
+                    // Populate dialog content
+                    const dialogContent = document.getElementById('manual-filter-content');
+                    if (dialogContent) {
+                        dialogContent.innerHTML = createManualFilterContent();
+                    }
+
+                    // Show dialog
+                    manualFilterDialog.style.display = 'block';
+
+                    // Setup export/import events after creating the content
+                    setupExportImportEvents();
+                });
+
+                // Close dialog button
+                if (closeFilterDialog) {
+                    closeFilterDialog.addEventListener('click', function() {
+                        manualFilterDialog.style.display = 'none';
+                    });
+                }
+
+                // Save changes button
+                if (saveManualFilters) {
+                    saveManualFilters.addEventListener('click', function() {
+                        // Save all the manual filter settings
+                        saveManualFilterSettings();
+
+                        // Hide dialog
+                        manualFilterDialog.style.display = 'none';
+
+                        // Notify user
+                        GM_notification({
+                            text: 'Advanced settings have been saved',
+                            title: 'Settings Updated',
+                            timeout: 3000
+                        });
+                    });
+                }
+            }
+
+            // Settings sections toggles
+            setupToggle('toggle-filter-settings', 'filter-settings-content');
+            setupToggle('toggle-performance-settings', 'performance-settings-content');
+            setupToggle('toggle-learning-settings', 'learning-settings-content');
+            setupToggle('toggle-monitored-list', 'monitored-tokens-list');
+
+            // Connect/disconnect buttons
+            const connectButton = document.getElementById('connect-ws');
+            const disconnectButton = document.getElementById('disconnect-ws');
+
+            if (connectButton) {
+                connectButton.addEventListener('click', function() {
+                    WebSocketManager.connect();
+                });
+            }
+
+            if (disconnectButton) {
+                disconnectButton.addEventListener('click', function() {
+                    WebSocketManager.disconnect();
+                });
+            }
+
+            // Auto-paste checkbox
+            const autoPasteCheckbox = document.getElementById('auto-paste');
+            if (autoPasteCheckbox) {
+                autoPasteCheckbox.addEventListener('change', function() {
+                    Config.update('sniperoo.autoPaste', this.checked);
+                });
+            }
+
+            // Learning System buttons
+            const saveLearningData = document.getElementById('save-learning-data');
+            const clearLearningData = document.getElementById('clear-learning-data');
+
+            if (saveLearningData) {
+                saveLearningData.addEventListener('click', function() {
+                    SelfLearningSystem.forceSave();
+                    GM_notification({
+                        text: 'Learning system data saved successfully',
+                        title: 'Data Saved',
+                        timeout: 3000
+                    });
+                });
+            }
+
+            if (clearLearningData) {
+                clearLearningData.addEventListener('click', function() {
+                    if (SelfLearningSystem.clearHistory()) {
+                        GM_notification({
+                            text: 'Learning system data cleared successfully',
+                            title: 'Data Cleared',
+                            timeout: 3000
+                        });
+                    }
+                });
+            }
+
+            // Filter settings inputs
+            setupNumberInput('min-market-cap', 'filters.minMarketCapUSD');
+            setupNumberInput('max-market-cap', 'filters.maxMarketCapUSD');
+            setupNumberInput('min-liquidity', 'filters.minInitialLiquidityUSD');
+            setupNumberInput('max-age', 'filters.maxTimeFromCreation');
+            setupNumberInput('min-unique-buyers', 'filters.minUniqueBuyers');
+            setupNumberInput('initial-buy-velocity', 'filters.initialBuyVelocity', true);
+            setupNumberInput('max-creator-supply', 'filters.maxCreatorSupplyPercent');
+            setupNumberInput('max-danger-score', 'filters.maxDangerScore');
+
+            // Performance settings inputs
+            setupNumberInput('min-price-increase', 'performance.minPriceIncrease');
+            setupNumberInput('min-trade-count', 'performance.minTradeCount');
+            setupNumberInput('buy-sell-ratio', 'performance.buyVsSellRatio', true); // Decimal input
+            setupNumberInput('early-threshold', 'performance.earlyDecisionThreshold');
+            setupNumberInput('initial-period', 'performance.initialMonitorPeriod');
+            setupNumberInput('extended-period', 'performance.extendedMonitorPeriod');
+            setupNumberInput('max-volatility', 'performance.maxVolatility');
+            setupCheckboxInput('prefer-stepped', 'performance.preferSteppedGrowth');
+            setupNumberInput('stepped-threshold', 'performance.steppedGrowthThreshold');
+            setupCheckboxInput('use-extended', 'performance.triggerExtendedMonitoring');
+
+            // Learning system inputs
+            setupCheckboxInput('learning-enabled', 'learning.enabled');
+            setupNumberInput('adaptation-strength', 'learning.adaptationStrength', true);
+            setupNumberInput('min-samples', 'learning.minSamplesForOptimization');
+        }
+
+        function setupNumberInput(id, configPath, decimal = false) {
+            const input = document.getElementById(id);
+            if (input) {
+                input.addEventListener('change', function() {
+                    const value = decimal ? parseFloat(this.value) : parseInt(this.value);
+                    Config.update(configPath, value || 0);
+                });
+            }
+        }
+
+        function setupCheckboxInput(id, configPath) {
+            const input = document.getElementById(id);
+            if (input) {
+                input.addEventListener('change', function() {
+                    Config.update(configPath, this.checked);
+                });
+            }
+        }
+
+        function saveManualFilterSettings() {
+            try {
+                // Get whitelist and blacklist values
+                const whitelistCreators = document.getElementById('whitelist-creators');
+                const blacklistCreators = document.getElementById('blacklist-creators');
+
+                if (whitelistCreators) {
+                    const whitelist = whitelistCreators.value.split(',')
+                        .map(addr => addr.trim())
+                        .filter(addr => addr.length > 0);
+                    Config.update('filters.whitelistedCreators', whitelist);
+                }
+
+                if (blacklistCreators) {
+                    const blacklist = blacklistCreators.value.split(',')
+                        .map(addr => addr.trim())
+                        .filter(addr => addr.length > 0);
+                    Config.update('filters.blacklistedCreators', blacklist);
+                }
+
+                // Get max supply
+                const maxSupply = document.getElementById('manual-max-supply');
+                if (maxSupply) {
+                    Config.update('filters.maxSupply', parseInt(maxSupply.value));
+                }
+
+                // Get NSFW filter
+                const excludeNSFW = document.getElementById('manual-exclude-nsfw');
+                if (excludeNSFW) {
+                    Config.update('filters.excludeNSFWNames', excludeNSFW.checked);
+                }
+
+                // Get Sniperoo integration settings
+                const autoSubmit = document.getElementById('manual-auto-submit');
+                if (autoSubmit) {
+                    Config.update('sniperoo.autoSubmit', autoSubmit.checked);
+                }
+
+                const submitSelector = document.getElementById('manual-submit-selector');
+                if (submitSelector) {
+                    Config.update('sniperoo.submitButtonSelector', submitSelector.value);
+                }
+
+                const inputSelector = document.getElementById('manual-input-selector');
+                if (inputSelector) {
+                    Config.update('sniperoo.addressInputSelector', inputSelector.value);
+                }
+
+                return true;
+            } catch (error) {
+                console.error('Error saving manual filter settings:', error);
+                return false;
+            }
+        }
+
+        function setupExportImportEvents() {
+            // Add event listeners for export/import buttons
+            const exportConfigBtn = document.getElementById('export-config');
+            const importConfigBtn = document.getElementById('import-config');
+            const exportImportArea = document.getElementById('export-import-area');
+            const configJson = document.getElementById('config-json');
+            const copyConfigBtn = document.getElementById('copy-config');
+            const applyImportBtn = document.getElementById('apply-import');
+
+            if (exportConfigBtn) {
+                exportConfigBtn.addEventListener('click', function() {
+                    if (exportImportArea) exportImportArea.style.display = 'block';
+                    if (configJson) configJson.value = Config.exportConfig();
+                    if (copyConfigBtn) copyConfigBtn.style.display = 'inline-block';
+                    if (applyImportBtn) applyImportBtn.style.display = 'none';
+                });
+            }
+
+            if (importConfigBtn) {
+                importConfigBtn.addEventListener('click', function() {
+                    if (exportImportArea) exportImportArea.style.display = 'block';
+                    if (configJson) configJson.value = '';
+                    if (configJson) configJson.placeholder = 'Paste your configuration JSON here...';
+                    if (copyConfigBtn) copyConfigBtn.style.display = 'none';
+                    if (applyImportBtn) applyImportBtn.style.display = 'inline-block';
+                });
+            }
+
+            if (copyConfigBtn) {
+                copyConfigBtn.addEventListener('click', function() {
+                    if (configJson) {
+                        configJson.select();
+                        document.execCommand('copy');
+                        GM_notification({
+                            text: 'Configuration copied to clipboard',
+                            title: 'Copied',
+                            timeout: 2000
+                        });
+                    }
+                });
+            }
+
+            if (applyImportBtn) {
+                applyImportBtn.addEventListener('click', function() {
+                    if (configJson && configJson.value.trim()) {
+                        try {
+                            const success = Config.importConfig(configJson.value);
+                            if (success) {
+                                GM_notification({
+                                    text: 'Configuration imported successfully',
+                                    title: 'Import Successful',
+                                    timeout: 3000
+                                });
+                                setTimeout(() => location.reload(), 1000);
+                            } else {
+                                GM_notification({
+                                    text: 'Failed to import configuration',
+                                    title: 'Import Failed',
+                                    timeout: 3000
+                                });
+                            }
+                        } catch (error) {
+                            console.error('Import error:', error);
+                            GM_notification({
+                                text: 'Invalid configuration format',
+                                title: 'Import Error',
+                                timeout: 3000
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
+        function updateUI() {
+            // Update connection status with modern styling
+            const connectionStatus = document.getElementById('connection-status');
+            if (connectionStatus) {
+                if (WebSocketManager.getConnectionStatus()) {
+                    connectionStatus.innerHTML = `
+                        <span class="pm-status-dot pm-status-dot-online"></span>
+                        Connected
+                    `;
+                    connectionStatus.style.color = 'var(--success)';
+                } else {
+                    connectionStatus.innerHTML = `
+                        <span class="pm-status-dot pm-status-dot-offline"></span>
+                        Disconnected
+                    `;
+                    connectionStatus.style.color = 'var(--danger)';
+                }
+            }
+
+            // Update monitored tokens count
+            const monitoredCountBadge = document.getElementById('monitored-count-badge');
+            if (monitoredCountBadge) {
+                monitoredCountBadge.textContent = TokenStore.getMonitoredCount();
+            }
+
+            // Update SOL price display
+            const solPriceValue = document.getElementById('sol-price-value');
+            const solPriceTime = document.getElementById('sol-price-time');
+            if (solPriceValue && solPriceTime) {
+                const price = Config.get().price;
+                solPriceValue.textContent = price.solUsdPrice.toFixed(2);
+
+                if (price.lastPriceUpdate) {
+                    const timeDiff = Math.floor((Date.now() - price.lastPriceUpdate) / 60000); // minutes
+                    solPriceTime.textContent = timeDiff === 0 ? 'Just now' : `${timeDiff}m ago`;
+                } else {
+                    solPriceTime.textContent = 'Never';
+                }
+            }
+
+            // Update market conditions badge
+            const marketConditionsBadge = document.getElementById('market-conditions-badge');
+            if (marketConditionsBadge && DynamicAdjustment.isInitialized()) {
+                const marketConditions = DynamicAdjustment.getMarketConditions();
+                const bullishText = marketConditions.bullishScore >= 70 ? 'Bullish' :
+                                   marketConditions.bullishScore <= 30 ? 'Bearish' : 'Neutral';
+
+                marketConditionsBadge.textContent = bullishText;
+                marketConditionsBadge.title = `SOL: $${marketConditions.solPrice.toFixed(2)} | Bullish: ${marketConditions.bullishScore}% | Volatility: ${marketConditions.marketVolatility.toFixed(1)}%`;
+
+                // Apply the right badge class
+                if (marketConditions.bullishScore >= 70) {
+                    marketConditionsBadge.className = 'pm-badge pm-badge-success';
+                } else if (marketConditions.bullishScore <= 30) {
+                    marketConditionsBadge.className = 'pm-badge pm-badge-danger';
+                } else {
+                    marketConditionsBadge.className = 'pm-badge pm-badge-warning';
+                }
+            }
+
+            // Update learning system stats
+            updateLearningStats();
+
+            // Update monitored tokens list
+            updateMonitoredTokensList();
+        }
+
+        function updateLearningStats() {
+            const tokensTracked = document.getElementById('tokens-tracked');
+            const successRate = document.getElementById('success-rate');
+            const creatorsTracked = document.getElementById('creators-tracked');
+            const whitelistCount = document.getElementById('whitelist-count');
+            const blacklistCount = document.getElementById('blacklist-count');
+
+            if (tokensTracked && successRate && creatorsTracked && whitelistCount && blacklistCount) {
+                const stats = SelfLearningSystem.getStats();
+
+                tokensTracked.textContent = stats.totalTokensTracked;
+                successRate.textContent = `${(stats.successRate * 100).toFixed(1)}%`;
+                creatorsTracked.textContent = stats.creatorsTracked;
+                whitelistCount.textContent = stats.whitelistedCreators;
+                blacklistCount.textContent = stats.blacklistedCreators;
+            }
+        }
+
+        function updateMonitoredTokensList() {
+            const monitoredTokensList = document.getElementById('monitored-tokens-list');
+            if (!monitoredTokensList) return;
+
+            const tokenMetrics = TokenStore.getMonitoredTokenMetrics();
+
+            if (tokenMetrics.length > 0) {
+                let listHTML = '';
+
+                for (const token of tokenMetrics) {
+                    const performanceConfig = Config.get().performance;
+
+                    // Determine performance badge class
+                    let performanceBadgeClass = 'pm-badge-secondary';
+                    if (token.metrics.marketCapChangePercent >= performanceConfig.minPriceIncrease) {
+                        performanceBadgeClass = 'pm-badge-success';
+                    } else if (token.metrics.marketCapChangePercent < 0) {
+                        performanceBadgeClass = 'pm-badge-danger';
+                    } else {
+                        performanceBadgeClass = 'pm-badge-warning';
+                    }
+
+                    // Growth pattern icon
+                    const growthIcon = token.metrics.isSteppedGrowth ? '🪜' : '📈';
+
+                    // Danger assessment
+                    const dangerAssessment = token.dangerAssessment || { score: 50, level: 'Moderate', dangersDetected: [] };
+
+                    // Danger level badges
+                    const dangerBadgeClass = {
+                        'Low': 'pm-badge-success',
+                        'Moderate': 'pm-badge-warning',
+                        'High': 'pm-badge-warning',
+                        'Extreme': 'pm-badge-danger'
+                    }[dangerAssessment.level] || 'pm-badge-secondary';
+
+                    // Generate warning indicators
+                    let warningHTML = '';
+                    if (dangerAssessment.dangersDetected && dangerAssessment.dangersDetected.length > 0) {
+                        dangerAssessment.dangersDetected.forEach(danger => {
+                            let warningIcon = '';
+                            let titleText = '';
+
+                            switch(danger.factor) {
+                                case 'creatorReputation':
+                                    warningIcon = '👤';
+                                    titleText = 'Low creator reputation score';
+                                    break;
+                                case 'creatorSupply':
+                                    warningIcon = '🔒';
+                                    titleText = 'Creator holds too much supply';
+                                    break;
+                                case 'uniqueBuyers':
+                                    warningIcon = '👥';
+                                    titleText = 'Not enough unique buyers';
+                                    break;
+                                case 'initialLiquidity':
+                                    warningIcon = '💧';
+                                    titleText = 'Low initial liquidity';
+                                    break;
+                                case 'tokenAge':
+                                    warningIcon = '🕒';
+                                    titleText = 'Token is very new';
+                                    break;
+                                default:
+                                    warningIcon = '⚠️';
+                                    titleText = `Risk factor: ${danger.factor}`;
+                            }
+
+                            warningHTML += `<span title="${titleText}: ${danger.value} (Threshold: ${danger.threshold})">${warningIcon}</span>`;
+                        });
+                    }
+
+                    // Create nice progress bar for time remaining
+                    const maxTime = token.phase === 'initial' ?
+                        Config.get().performance.initialMonitorPeriod :
+                        Config.get().performance.extendedMonitorPeriod;
+
+                    const timePercentage = 100 - Math.min(100, Math.max(0, (token.timeLeft / maxTime) * 100));
+
+                    // Progress bar color using CSS variables
+                    const progressColor = token.metrics.marketCapChangePercent >= performanceConfig.minPriceIncrease ?
+                        'var(--success)' :
+                        token.metrics.marketCapChangePercent < 0 ?
+                            'var(--danger)' :
+                            'var(--warning)';
+
+                    // Token list item with modern styling
+                    listHTML += `
+                        <div class="token-item" data-mint="${token.mint}" data-bonding-key="${token.bondingCurveKey || ''}">
+                            <div class="pm-flex">
+                                <span style="font-weight: 600;">${token.name}</span>
+                                <span class="pm-badge ${performanceBadgeClass}">${token.metrics.marketCapChangePercent.toFixed(1)}%</span>
+                            </div>
+
+                            <div class="pm-flex pm-mt-1" style="font-size: 11px; color: var(--text-secondary);">
+                                <span>${token.phase === 'initial' ? 'Initial' : 'Extended'}</span>
+                                <span>${Utils.formatTime(token.timeLeft)}</span>
+                            </div>
+
+                            <div class="pm-progress-bar">
+                                <div class="pm-progress-bar-inner" style="width: ${timePercentage}%; background-color: ${progressColor}"></div>
+                            </div>
+
+                            <div class="pm-flex pm-mt-2">
+                                <span style="color: var(--text-secondary); font-size: 12px;">Trades: ${token.metrics.tradeCount}</span>
+                                <span style="color: var(--text-secondary); font-size: 12px;">B/S: ${token.metrics.buyToSellRatio.toFixed(1)}</span>
+                                <span style="color: var(--text-secondary); font-size: 12px;">Buyers: ${token.metrics.uniqueBuyerCount}</span>
+                                <span style="color: ${token.metrics.volatility <= performanceConfig.maxVolatility ? 'var(--success)' : 'var(--warning)'}">${growthIcon} Vol: ${token.metrics.volatility.toFixed(1)}%</span>
+                            </div>
+
+                            <div class="pm-flex pm-mt-2" style="align-items: center;">
+                                <div style="font-size: 14px;">${warningHTML}</div>
+                                <span class="pm-badge ${dangerBadgeClass}">${dangerAssessment.level} ${dangerAssessment.score.toFixed(0)}</span>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                monitoredTokensList.innerHTML = listHTML;
+
+                // Add click handlers for token items
+                const tokenItems = monitoredTokensList.querySelectorAll('.token-item');
+                tokenItems.forEach(item => {
+                    item.addEventListener('click', function() {
+                        const bondingCurveKey = this.getAttribute('data-bonding-key');
+                        if (bondingCurveKey) {
+                            // Open Axiom Trade in a new tab
+                            window.open(`https://axiom.trade/meme/${bondingCurveKey}`, '_blank');
+                        } else {
+                            // If no bonding curve key, show an alert
+                            GM_notification({
+                                text: `No bonding curve key available for this token`,
+                                title: 'Chart Unavailable',
+                                timeout: 3000
+                            });
+                            console.warn('No bonding curve key available for token:', this.getAttribute('data-mint'));
+                        }
+                    });
+                });
+            } else {
+                monitoredTokensList.innerHTML = '<div style="padding: 12px; color: var(--text-secondary); font-style: italic; font-size: 12px; text-align: center;">No tokens being monitored</div>';
+            }
+        }
+
+        return {
+            init: function() {
+                // Create the UI
+                elements.container = createUI();
+
+                // Setup event listeners
+                if (elements.container) {
+                    setupEventListeners();
+
+                    // Set interval to update UI
+                    setInterval(updateUI, 1000);
+                }
+            }
+        };
+    })();
+
+    /**
+     * Price Service Module
+     * Handles fetching and updating the SOL/USD price
+     */
+    const PriceService = (function() {
+        async function updateSolPrice() {
+            try {
+                const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+                const data = await response.json();
+
+                if (data && data.solana && data.solana.usd) {
+                    const newPrice = parseFloat(data.solana.usd);
+
+                    // Update the price in config
+                    Config.update('price.solUsdPrice', newPrice);
+                    Config.update('price.lastPriceUpdate', Date.now());
+
+                    console.log(`Updated SOL price: ${newPrice.toFixed(2)} USD`);
+
+                    // Update UI price displays
+                    updatePriceDisplays(newPrice);
+
+                    return newPrice;
+                }
+            } catch (error) {
+                console.error('Failed to update SOL price:', error);
+            }
+
+            return null;
+        }
+
+        function updatePriceDisplays(price) {
+            // Update all places in the UI where SOL price is displayed
+            const priceDisplays = document.querySelectorAll('.sol-price-display');
+            priceDisplays.forEach(display => {
+                display.textContent = `${price.toFixed(2)}`;
+            });
+
+            // Update the price in the UI
+            const solPriceValue = document.getElementById('sol-price-value');
+            if (solPriceValue) {
+                solPriceValue.textContent = price.toFixed(2);
+            }
+
+            const solPriceTime = document.getElementById('sol-price-time');
+            if (solPriceTime) {
+                solPriceTime.textContent = 'Just now';
+            }
+        }
+
+        function checkAndUpdatePrice() {
+            const config = Config.get();
+            const now = Date.now();
+
+            // Update price if it's been longer than the update interval
+            if (now - config.price.lastPriceUpdate > config.price.priceUpdateInterval) {
+                updateSolPrice();
+            }
+        }
+
+        return {
+            init: function() {
+                // Update price immediately
+                updateSolPrice();
+
+                // Set up interval to check and update price
+                setInterval(checkAndUpdatePrice, 60000); // Check every minute
+            },
+
+            // Manual update function that can be called when needed
+            updatePrice: function() {
+                return updateSolPrice();
+            }
+        };
+    })();
+
+    /**
+     * Main App Module
+     * Coordinates the application and initializes all modules
+     */
+    const App = (function() {
+        function init() {
+            // Only start on sniperoo page - enhanced URL detection
+            if (window.location.href.includes('sniperoo') || window.location.hostname === 'sniperoo.app') {
+                console.log('Initializing Pump.fun AI Token Monitor on Sniperoo...', window.location.href);
+
+                // Initialize self-learning system first (loads stored data)
+                SelfLearningSystem.init();
+
+                // Initialize price service
+                PriceService.init();
+
+                // Initialize dynamic adjustment system
+                DynamicAdjustment.init();
+
+                // Initialize UI with a slight delay to ensure page is fully loaded
+                setTimeout(() => {
+                    UI.init();
+                    console.log('UI initialized');
+                }, 1000);
+
+                // Setup Sniperoo integration
+                SniperooIntegration.setup();
+
+                // Connect to WebSocket after a short delay
+                setTimeout(() => {
+                    WebSocketManager.connect();
+                }, 2000);
+
+                // Schedule periodic tasks
+                setInterval(() => {
+                    WebSocketManager.processTokenStore();
+                }, 1000);
+
+                // Display welcome message
+                setTimeout(() => {
+                    GM_notification({
+                        text: 'AI-enhanced trading bot is now active. Monitoring for profitable tokens...',
+                        title: 'Pump.fun AI Token Monitor',
+                        timeout: 5000
+                    });
+                }, 3000);
+
+                console.log('Pump.fun AI Token Monitor initialized successfully');
+            }
+        }
+
+        return {
+            init: init
+        };
+    })();
+
+    // Function to check if page is ready and start the application
+    function startApp() {
+        try {
+            console.log('Starting Pump.fun AI Token Monitor on: ' + window.location.href);
+
+            // Check if body exists
+            if (!document.body) {
+                console.log('Body not ready, waiting...');
+                setTimeout(startApp, 500);
+                return;
+            }
+
+            App.init();
+
+            // Add a mutation observer to handle SPA navigation
+            const observer = new MutationObserver((mutations) => {
+                // If URL changes in a SPA, re-initialize
+                mutations.forEach((mutation) => {
+                    if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                        setTimeout(() => {
+                            // Check if our UI is still present
+                            if (!document.getElementById('pump-monitor-ui')) {
+                                console.log('Detected SPA navigation, reinitializing...');
+                                App.init();
+                            }
+                        }, 1000);
+                    }
+                });
+            });
+
+            observer.observe(document.body, { childList: true, subtree: true });
+
+        } catch (error) {
+            console.error('Error initializing Pump.fun AI Token Monitor:', error);
+            // Try to notify user even if initialization fails
+            try {
+                GM_notification({
+                    text: 'Error initializing trading bot. Please check console (F12) for details.',
+                    title: 'Initialization Error',
+                    timeout: 10000
+                });
+            } catch (e) {
+                console.error('Could not show notification:', e);
+            }
+        }
+    }
+
+    // Start when document is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', startApp);
+    } else {
+        startApp();
+    }
+
+// Reasoning Panel Module
+const ReasoningPanel = (function() {
+    function createReasoningPanel() {
+        console.log('Creating Reasoning Panel - Starting');
+
+        // Create panel container
+        const panel = document.createElement('div');
+        panel.id = 'reasoning-panel';
+        panel.style.border = '1px solid red';
+        panel.style.padding = '10px';
+        panel.style.margin = '10px';
+        panel.innerHTML = `
+            <h3>AI Reasoning (Debug Version)</h3>
+            <div id="reasoning-messages">
+                Debug messages will appear here
+            </div>
+        `;
+
+        // Find the monitored tokens section
+        const monitoredTokensSection = document.querySelector('#monitored-tokens-list');
+
+        if (monitoredTokensSection) {
+            console.log('Found monitored tokens section');
+            const parentSection = monitoredTokensSection.closest('.section-card');
+
+            if (parentSection) {
+                console.log('Inserting panel after monitored tokens section');
+                parentSection.insertAdjacentElement('afterend', panel);
+            } else {
+                console.error('Could not find parent section');
+            }
+        } else {
+            console.error('Could not find monitored tokens section');
+        }
+    }
+
+    return {
+        init: function() {
+            console.log('Reasoning Panel Init - Starting');
+
+            // Try multiple times with different delays
+            setTimeout(createReasoningPanel, 1000);
+            setTimeout(createReasoningPanel, 3000);
+            setTimeout(createReasoningPanel, 5000);
+        }
+    };
+})();
+
+// Modify the App initialization to include Reasoning Panel
+const originalInit = App.init;
+App.init = function() {
+    originalInit();
+    ReasoningPanel.init();
+};})();
