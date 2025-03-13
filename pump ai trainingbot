@@ -1,0 +1,99 @@
+
+Tampermonkey® by Jan Biniok
+v5.3.3
+	
+Pump.fun AI Training Bot
+by You
+1
+// ==UserScript==
+2
+// @name         Pump.fun AI Training Bot
+3
+// @namespace    http://tampermonkey.net/
+4
+// @version      1.0
+5
+// @description  Advanced training bot for DeFi token pattern recognition
+6
+// @author       You
+7
+// @match        *://*.pump.fun/*
+8
+// @match        *://pump.fun/*
+9
+// @grant        GM_setValue
+10
+// @grant        GM_getValue
+11
+// @grant        GM_deleteValue
+12
+// @grant        GM_listValues
+13
+// @grant        GM_notification
+14
+// @grant        GM_xmlhttpRequest
+15
+// @grant        unsafeWindow
+16
+// @connect      public-api.solscan.io
+17
+// @connect      price.jup.ag
+18
+// @connect      api.coingecko.com
+19
+// @connect      cdn.jsdelivr.net
+20
+// @require      https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js
+21
+// ==/UserScript==
+22
+​
+23
+(function() {
+24
+    'use strict';
+25
+​
+26
+    // =========================================
+27
+    // Core Modules - These manage the bot framework
+28
+    // =========================================
+29
+​
+30
+    /**
+31
+     * Config Module
+32
+     * Manages all configuration settings with persistence
+33
+     */
+34
+    const Config = (function() {
+35
+        // Default configuration
+36
+        const defaults = {
+37
+            // General settings
+38
+            general: {
+39
+                botName: 'Nebula',
+40
+                startupMessage: 'Training system initialized. Collecting token data...',
+41
+                version: '1.0.0',
+42
+                debugMode: false
+43
+            },
+44
+​
+Tam - Your service bot
+
+Do you need help working with Tampermonkey?
+Disable
+Tampermonkey Bot
